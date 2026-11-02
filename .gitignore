@@ -1,0 +1,39 @@
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+__pycache__/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Build files
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Testing
+coverage/
+
+# Temporary files
+*.tmp
+*.bak
