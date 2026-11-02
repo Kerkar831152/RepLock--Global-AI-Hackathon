@@ -1,14 +1,23 @@
 
-# Dependencies
-node_modules/
-venv/
+# Python virtual environment
+replock_env/
 .venv/
+venv/
+
+# Python cache
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Environment variables
 .env
 .env.*
 !.env.example
+
+# Node dependencies
+node_modules/
 
 # Build files
 dist/
@@ -26,14 +35,13 @@ npm-debug.log*
 .DS_Store
 Thumbs.db
 
-# Python
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-
 # Testing
 coverage/
+htmlcov/
 
 # Temporary files
 *.tmp
 *.bak
+
+# Jupyter
+.ipynb_checkpoints/
