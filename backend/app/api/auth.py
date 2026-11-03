@@ -1,3 +1,4 @@
+
 import os
 import secrets
 import hmac
@@ -12,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.security import encrypt_token, create_access_token
 from app.models import User
 from app.schemas.user import UserResponse
 
@@ -58,7 +60,7 @@ def github_login():
     return response
 
 
-@router.get("/github/callback", response_model=UserResponse)
+@router.get("/github/callback")
 def github_callback(
     request: Request,
     code: str,
@@ -124,7 +126,8 @@ def github_callback(
                 email_response.raise_for_status()
 
                 emails = email_response.json()
-                primary_email = next(
+
+                email = next(
                     (
                         item["email"]
                         for item in emails
@@ -132,8 +135,6 @@ def github_callback(
                     ),
                     None
                 )
-
-                email = primary_email
 
     except httpx.HTTPError:
         raise HTTPException(
@@ -149,6 +150,7 @@ def github_callback(
 
     if existing_user:
         existing_user.username = profile["login"]
+        existing_user.github_access_token_encrypted = encrypt_token(access_token)
 
         if email:
             email_owner = db.scalar(
@@ -156,7 +158,10 @@ def github_callback(
             )
 
             if email_owner and email_owner.id != existing_user.id:
-                raise HTTPException(status_code=409, detail="Email already associated with another user")
+                raise HTTPException(
+                    status_code=409,
+                    detail="Email already associated with another user"
+                )
 
             existing_user.email = email
 
@@ -171,12 +176,16 @@ def github_callback(
             )
 
             if email_owner:
-                raise HTTPException(status_code=409, detail="Email already associated with another user")
+                raise HTTPException(
+                    status_code=409,
+                    detail="Email already associated with another user"
+                )
 
         user = User(
             github_id=github_id,
             username=profile["login"],
-            email=email
+            email=email,
+            github_access_token_encrypted=encrypt_token(access_token)
         )
 
         db.add(user)
@@ -186,6 +195,17 @@ def github_callback(
             db.refresh(user)
         except IntegrityError:
             db.rollback()
-            raise HTTPException(status_code=409, detail="Unable to create user")
+            raise HTTPException(
+                status_code=409,
+                detail="Unable to create user"
+            )
 
-    return user
+    jwt_token = create_access_token({
+        "sub": str(user.id)
+    })
+
+    return {
+        "access_token": jwt_token,
+        "token_type": "bearer",
+        "user": UserResponse.model_validate(user)
+    }
