@@ -3,6 +3,7 @@ from app.api.users import router as users_router
 from app.api.repositories import router as repositories_router
 from app.api.scans import router as scans_router
 from app.api.findings import router as findings_router
+from app.api.auth import router as auth_router
 
 app = FastAPI(
     title="RepLock API",
@@ -14,6 +15,7 @@ app.include_router(users_router, prefix="/api/v1")
 app.include_router(repositories_router, prefix="/api/v1")
 app.include_router(scans_router, prefix="/api/v1")
 app.include_router(findings_router, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1")
 
 @app.get("/")
 def home():
