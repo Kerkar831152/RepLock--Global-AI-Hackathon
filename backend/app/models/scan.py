@@ -1,7 +1,8 @@
+
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, DateTime, ForeignKey, Text
+from sqlalchemy import String, DateTime, ForeignKey, Text, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -21,5 +22,9 @@ class Scan(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-    repository = relationship("Repository", back_populates="scans")
-    findings = relationship("Finding", back_populates="scan", cascade="all, delete-orphan")
+    repository: Mapped["Repository"] = relationship("Repository", back_populates="scans")
+    findings: Mapped[list["Finding"]] = relationship("Finding", back_populates="scan", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("ix_scans_repository_id", "repository_id"),
+    )

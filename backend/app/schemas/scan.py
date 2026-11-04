@@ -1,11 +1,15 @@
+
 import uuid
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict
+
+from pydantic import BaseModel, ConfigDict, Field
+
 
 class ScanCreate(BaseModel):
     repository_id: uuid.UUID
     commit_sha: str | None = None
-    scan_type: str = "full"
+    scan_type: str = Field(default="full", pattern="^(full|static|dynamic)$")
+
 
 class ScanResponse(BaseModel):
     id: uuid.UUID

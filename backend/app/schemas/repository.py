@@ -1,6 +1,9 @@
+
 import uuid
 from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict
+
 
 class RepositoryCreate(BaseModel):
     github_repo_id: str
@@ -9,7 +12,7 @@ class RepositoryCreate(BaseModel):
     description: str | None = None
     default_branch: str = "main"
     is_private: bool = False
-    owner_id: uuid.UUID
+
 
 class RepositoryResponse(BaseModel):
     id: uuid.UUID

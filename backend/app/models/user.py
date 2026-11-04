@@ -1,13 +1,16 @@
+
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, DateTime
+from sqlalchemy import String, DateTime, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import String, DateTime, Text
 
 from app.core.database import Base
+from typing import TYPE_CHECKING
 
+if TYPE_CHECKING:
+    from app.models.repository import Repository
 
 class User(Base):
     __tablename__ = "users"
@@ -19,4 +22,8 @@ class User(Base):
     github_access_token_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-    repositories = relationship("Repository", back_populates="owner", cascade="all, delete-orphan")
+    repositories: Mapped[list["Repository"]] = relationship(
+        "Repository",
+        back_populates="owner",
+        cascade="all, delete-orphan"
+    )

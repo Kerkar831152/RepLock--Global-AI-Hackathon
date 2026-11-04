@@ -1,12 +1,17 @@
+
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, DateTime, ForeignKey, Text, Integer
+from sqlalchemy import String, DateTime, ForeignKey, Text, Integer, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.models.scan import Scan
 
 class Finding(Base):
     __tablename__ = "findings"
@@ -24,4 +29,8 @@ class Finding(Base):
     status: Mapped[str] = mapped_column(String(30), default="open", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-    scan = relationship("Scan", back_populates="findings")
+    scan: Mapped["Scan"] = relationship("Scan", back_populates="findings")
+
+    __table_args__ = (
+        Index("ix_findings_scan_id", "scan_id"),
+    )

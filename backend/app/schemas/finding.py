@@ -1,17 +1,22 @@
+
 import uuid
 from datetime import datetime
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict
+
 
 class FindingCreate(BaseModel):
     scan_id: uuid.UUID
     title: str
     description: str
-    severity: str
+    severity: Literal["critical", "high", "medium", "low", "info"]
     vulnerability_type: str
     file_path: str | None = None
     line_number: int | None = None
     evidence: str | None = None
     remediation: str | None = None
+
 
 class FindingResponse(BaseModel):
     id: uuid.UUID
