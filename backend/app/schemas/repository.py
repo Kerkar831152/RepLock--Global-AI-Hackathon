@@ -7,11 +7,6 @@ from pydantic import BaseModel, ConfigDict
 
 class RepositoryCreate(BaseModel):
     github_repo_id: str
-    name: str
-    full_name: str
-    description: str | None = None
-    default_branch: str = "main"
-    is_private: bool = False
 
 
 class RepositoryResponse(BaseModel):

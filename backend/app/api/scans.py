@@ -1,9 +1,12 @@
 
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -12,6 +15,10 @@ from app.models import User, Repository, Scan
 from app.schemas.scan import ScanCreate, ScanResponse
 
 router = APIRouter(prefix="/scans", tags=["Scans"])
+
+
+class ScanStatusUpdate(BaseModel):
+    status: Literal["pending", "running", "completed", "failed"]
 
 
 @router.post("/", response_model=ScanResponse, status_code=status.HTTP_201_CREATED)
@@ -32,8 +39,13 @@ def create_scan(
 
     new_scan = Scan(**scan_data.model_dump())
     db.add(new_scan)
-    db.commit()
-    db.refresh(new_scan)
+
+    try:
+        db.commit()
+        db.refresh(new_scan)
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Unable to create scan")
 
     return new_scan
 
@@ -75,7 +87,7 @@ def get_scan(
 @router.patch("/{scan_id}/status", response_model=ScanResponse)
 def update_scan_status(
     scan_id: uuid.UUID,
-    new_status: str,
+    update_data: ScanStatusUpdate,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -91,11 +103,7 @@ def update_scan_status(
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
 
-    allowed_statuses = {"pending", "running", "completed", "failed"}
-
-    if new_status not in allowed_statuses:
-        raise HTTPException(status_code=400, detail="Invalid scan status")
-
+    new_status = update_data.status
     scan.status = new_status
 
     if new_status == "running" and scan.started_at is None:
