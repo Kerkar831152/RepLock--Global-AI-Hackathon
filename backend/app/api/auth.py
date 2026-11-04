@@ -17,6 +17,8 @@ from app.core.security import encrypt_token, create_access_token
 from app.models import User
 from app.schemas.user import UserResponse
 
+from app.core.dependencies import get_current_user
+
 load_dotenv()
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
@@ -209,3 +211,10 @@ def github_callback(
         "token_type": "bearer",
         "user": UserResponse.model_validate(user)
     }
+
+
+@router.get("/me", response_model=UserResponse)
+def get_logged_in_user(
+    current_user: User = Depends(get_current_user)
+):
+    return current_user
