@@ -1,11 +1,12 @@
+
 import uuid
 from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -32,9 +33,23 @@ class ScanRunResponse(BaseModel):
     findings: list[FindingResponse]
     semgrep_findings: int
     files_analyzed: int
-    limitations: list[str] = []
+    limitations: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
+
+
+def mark_scan_failed(db: Session, scan_id: uuid.UUID):
+    try:
+        scan = db.get(Scan, scan_id)
+
+        if scan:
+            scan.status = "failed"
+            scan.completed_at = datetime.now(timezone.utc)
+            scan.summary = "Security scan failed"
+            db.commit()
+
+    except SQLAlchemyError:
+        db.rollback()
 
 
 @router.post(
@@ -76,11 +91,11 @@ async def run_repository_scan(
         access_token = decrypt_token(
             current_user.github_access_token_encrypted
         )
-    except Exception:
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail="Unable to access GitHub credentials"
-        )
+        ) from exc
 
     new_scan = Scan(
         repository_id=repository.id,
@@ -95,12 +110,12 @@ async def run_repository_scan(
     try:
         db.commit()
         db.refresh(new_scan)
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
         raise HTTPException(
             status_code=400,
             detail="Unable to create scan"
-        )
+        ) from exc
 
     try:
         result = await scan_orchestrator.run(
@@ -120,8 +135,13 @@ async def run_repository_scan(
                     title=item.title[:255],
                     description=item.description,
                     severity=item.severity,
-                    vulnerability_type=item.vulnerability_type[:100],
-                    file_path=item.file_path[:500],
+                    vulnerability_type=(
+                        item.vulnerability_type or "unknown"
+                    )[:100],
+                    file_path=(
+                        item.file_path[:500]
+                        if item.file_path else None
+                    ),
                     line_number=item.line_start,
                     evidence=item.evidence,
                     remediation=item.remediation
@@ -134,7 +154,7 @@ async def run_repository_scan(
         findings = db.scalars(
             select(Finding)
             .where(Finding.scan_id == new_scan.id)
-            .order_by(Finding.created_at.asc())
+            .order_by(Finding.created_at.asc(), Finding.id.asc())
         ).all()
 
         return ScanRunResponse(
@@ -147,25 +167,18 @@ async def run_repository_scan(
 
     except Exception as exc:
         db.rollback()
-
-        failed_scan = db.get(Scan, new_scan.id)
-
-        if failed_scan:
-            failed_scan.status = "failed"
-            failed_scan.completed_at = datetime.now(timezone.utc)
-            failed_scan.summary = "Security scan failed"
-            db.commit()
+        mark_scan_failed(db, new_scan.id)
 
         if isinstance(exc, ScanOrchestrationError):
             raise HTTPException(
                 status_code=502,
                 detail=str(exc)
-            )
+            ) from exc
 
         raise HTTPException(
             status_code=502,
             detail="Repository security scan failed"
-        )
+        ) from exc
 
 
 @router.post(
@@ -178,6 +191,12 @@ def create_scan(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    if scan_data.scan_type == "dynamic":
+        raise HTTPException(
+            status_code=400,
+            detail="Dynamic scanning is not available yet"
+        )
+
     repository = db.scalar(
         select(Repository).where(
             Repository.id == scan_data.repository_id,
@@ -186,7 +205,10 @@ def create_scan(
     )
 
     if not repository:
-        raise HTTPException(status_code=404, detail="Repository not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Repository not found"
+        )
 
     new_scan = Scan(**scan_data.model_dump())
     db.add(new_scan)
@@ -194,9 +216,12 @@ def create_scan(
     try:
         db.commit()
         db.refresh(new_scan)
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=400, detail="Unable to create scan")
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to create scan"
+        ) from exc
 
     return new_scan
 
@@ -230,7 +255,10 @@ def get_scan(
     )
 
     if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found"
+        )
 
     return scan
 
@@ -252,7 +280,10 @@ def update_scan_status(
     )
 
     if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found"
+        )
 
     new_status = update_data.status
     scan.status = new_status

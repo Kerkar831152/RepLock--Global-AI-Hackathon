@@ -15,6 +15,8 @@ from app.api.security_analysis import router as security_analysis_router
 from app.services.ai_service import ai_service
 from app.services.research_service import research_service
 
+from app.api.dashboard import router as dashboard_router
+from app.api.repository_security import router as repository_security_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -49,7 +51,8 @@ app.include_router(auth_router, prefix="/api/v1")
 app.include_router(ai_router, prefix="/api/v1")
 app.include_router(research_router, prefix="/api/v1")
 app.include_router(security_analysis_router, prefix="/api/v1")
-
+app.include_router(dashboard_router, prefix="/api/v1")
+app.include_router(repository_security_router, prefix="/api/v1")
 
 @app.get("/")
 def home():

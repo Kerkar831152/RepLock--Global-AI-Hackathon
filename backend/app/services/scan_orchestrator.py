@@ -55,6 +55,14 @@ class ScanOrchestrator:
         ".crt", ".cer", ".der"
     }
 
+    SENSITIVE_NAMES = {
+        ".env", ".env.local", ".env.production",
+        ".env.development", "credentials.json",
+        "secrets.json", "secrets.yaml", "secrets.yml",
+        "service-account.json", "id_rsa", "id_ed25519",
+        "private_key", "privatekey"
+    }
+
     SEVERITY_ORDER = {
         "critical": 0,
         "high": 1,
@@ -73,13 +81,23 @@ class ScanOrchestrator:
                     access_token,
                     repository_path
                 )
+            except RepositoryDownloadError as exc:
+                raise ScanOrchestrationError(str(exc)) from exc
+            except Exception as exc:
+                raise ScanOrchestrationError(
+                    "Repository download failed unexpectedly"
+                ) from exc
 
+            try:
                 scanner_result = await semgrep_service.scan(
                     str(repository_path)
                 )
-
-            except (RepositoryDownloadError, SemgrepError) as exc:
+            except SemgrepError as exc:
                 raise ScanOrchestrationError(str(exc)) from exc
+            except Exception as exc:
+                raise ScanOrchestrationError(
+                    "Security scanner failed unexpectedly"
+                ) from exc
 
             source_files = self._read_source_files(repository_path)
 
@@ -134,10 +152,13 @@ class ScanOrchestrator:
 
             try:
                 analysis = await security_analysis_service.analyze(request)
-
             except SecurityAnalysisError as exc:
                 raise ScanOrchestrationError(
                     "AI security analysis could not be completed"
+                ) from exc
+            except Exception as exc:
+                raise ScanOrchestrationError(
+                    "AI security analysis failed unexpectedly"
                 ) from exc
 
             summary = (
@@ -153,10 +174,7 @@ class ScanOrchestrator:
                     "scanner warning(s)."
                 )
 
-            if (
-                scanner_result["total_findings"]
-                > len(scanner_signals)
-            ):
+            if len(scanner_signals) < scanner_result["total_findings"]:
                 analysis.limitations.append(
                     "Only a limited selection of Semgrep findings and "
                     "source-code context was submitted for AI validation."
@@ -174,6 +192,7 @@ class ScanOrchestrator:
     def _read_source_files(self, root: Path) -> list[dict]:
         files = []
         total_size = 0
+        root = root.resolve()
 
         for current_dir, directories, filenames in os.walk(
             root,
@@ -190,21 +209,26 @@ class ScanOrchestrator:
 
             for filename in sorted(filenames):
                 path = current_path / filename
+                lower_name = filename.lower()
 
                 if path.is_symlink():
                     continue
 
-                if filename.startswith(".env"):
-                    continue
-
-                if path.suffix.lower() in self.IGNORED_SUFFIXES:
+                if (
+                    lower_name.startswith(".env")
+                    or lower_name in self.SENSITIVE_NAMES
+                    or path.suffix.lower() in self.IGNORED_SUFFIXES
+                ):
                     continue
 
                 if len(files) >= self.MAX_SOURCE_FILES:
                     return files
 
                 try:
-                    size = path.stat().st_size
+                    resolved = path.resolve()
+                    resolved.relative_to(root)
+
+                    size = resolved.stat().st_size
 
                     if (
                         size <= 0
@@ -215,7 +239,7 @@ class ScanOrchestrator:
                     if total_size + size > self.MAX_SOURCE_TOTAL_SIZE:
                         return files
 
-                    content = path.read_text(
+                    content = resolved.read_text(
                         encoding="utf-8",
                         errors="replace"
                     )
@@ -224,13 +248,13 @@ class ScanOrchestrator:
                         continue
 
                     files.append({
-                        "path": path.relative_to(root).as_posix(),
+                        "path": resolved.relative_to(root).as_posix(),
                         "content": content
                     })
 
                     total_size += size
 
-                except OSError:
+                except (OSError, ValueError):
                     continue
 
         return files
@@ -272,8 +296,8 @@ class ScanOrchestrator:
             )
 
             return (
-                -len(findings),
                 severity,
+                -len(findings),
                 -name_score,
                 len(item["content"])
             )

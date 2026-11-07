@@ -125,15 +125,25 @@ class SemgrepService:
             start = item.get("start") or {}
 
             raw_path = str(item.get("path") or "").replace("\\", "/")
+            root_path = root.as_posix().rstrip("/")
+            root_lower = root_path.casefold()
+            raw_lower = raw_path.casefold()
+
+            if raw_lower == root_lower:
+                continue
+
+            if raw_lower.startswith(root_lower + "/"):
+                raw_path = raw_path[len(root_path) + 1:]
+
             relative_path = PurePosixPath(raw_path)
 
             if relative_path.is_absolute() or ".." in relative_path.parts:
                 continue
 
-            normalized_path = relative_path.as_posix()
+            normalized_path = relative_path.as_posix().removeprefix("./")
 
-            if normalized_path.startswith("./"):
-                normalized_path = normalized_path[2:]
+            if not normalized_path or normalized_path == ".":
+                continue
 
             severity = self.SEVERITY_MAP.get(
                 str(extra.get("severity", "WARNING")).upper(),
