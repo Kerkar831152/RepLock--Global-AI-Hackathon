@@ -17,6 +17,7 @@ from app.services.research_service import research_service
 
 from app.api.dashboard import router as dashboard_router
 from app.api.repository_security import router as repository_security_router
+from app.api.pull_requests import router as pull_requests_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -53,6 +54,7 @@ app.include_router(research_router, prefix="/api/v1")
 app.include_router(security_analysis_router, prefix="/api/v1")
 app.include_router(dashboard_router, prefix="/api/v1")
 app.include_router(repository_security_router, prefix="/api/v1")
+app.include_router(pull_requests_router, prefix="/api/v1")
 
 @app.get("/")
 def home():
