@@ -1,25 +1,74 @@
-import uuid
-from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
-from sqlalchemy import select
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models import User, Repository, Scan, Finding
-from app.schemas.finding import FindingCreate, FindingResponse
+from app.schemas.finding import (
+    FindingCreate,
+    FindingResponse,
+    FindingStatusUpdate,
+    FindingListResponse,
+    FindingSummaryResponse
+)
 
 router = APIRouter(prefix="/findings", tags=["Findings"])
 
 
-class FindingStatusUpdate(BaseModel):
-    status: Literal["open", "in_progress", "resolved", "false_positive"]
+SEVERITIES = ("critical", "high", "medium", "low", "info")
+STATUSES = ("open", "in_progress", "resolved", "false_positive")
 
 
-@router.post("/", response_model=FindingResponse, status_code=status.HTTP_201_CREATED)
+def _finding_query(current_user: User):
+    return (
+        select(Finding)
+        .join(Scan, Finding.scan_id == Scan.id)
+        .join(Repository, Scan.repository_id == Repository.id)
+        .where(Repository.owner_id == current_user.id)
+    )
+
+
+def _apply_filters(
+    query,
+    severity,
+    finding_status,
+    scan_id,
+    repository_id,
+    search
+):
+    if severity:
+        query = query.where(Finding.severity == severity)
+
+    if finding_status:
+        query = query.where(Finding.status == finding_status)
+
+    if scan_id:
+        query = query.where(Finding.scan_id == scan_id)
+
+    if repository_id:
+        query = query.where(Scan.repository_id == repository_id)
+
+    if search:
+        term = f"%{search.strip()}%"
+        query = query.where(
+            Finding.title.ilike(term)
+            | Finding.description.ilike(term)
+            | Finding.file_path.ilike(term)
+        )
+
+    return query
+
+
+@router.post(
+    "/",
+    response_model=FindingResponse,
+    status_code=status.HTTP_201_CREATED
+)
 def create_finding(
     finding_data: FindingCreate,
     db: Session = Depends(get_db),
@@ -27,7 +76,7 @@ def create_finding(
 ):
     scan = db.scalar(
         select(Scan)
-        .join(Repository)
+        .join(Repository, Scan.repository_id == Repository.id)
         .where(
             Scan.id == finding_data.scan_id,
             Repository.owner_id == current_user.id
@@ -35,7 +84,10 @@ def create_finding(
     )
 
     if not scan:
-        raise HTTPException(status_code=404, detail="Scan not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Scan not found"
+        )
 
     new_finding = Finding(**finding_data.model_dump())
     db.add(new_finding)
@@ -45,48 +97,140 @@ def create_finding(
         db.refresh(new_finding)
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Unable to create finding")
+        raise HTTPException(
+            status_code=409,
+            detail="Unable to create finding"
+        )
 
     return new_finding
 
 
-@router.get("/", response_model=list[FindingResponse])
-def get_findings(
+@router.get(
+    "/summary",
+    response_model=FindingSummaryResponse
+)
+def get_finding_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    return db.scalars(
-        select(Finding)
-        .join(Scan)
-        .join(Repository)
+    base_query = _finding_query(current_user)
+
+    total = db.scalar(
+        select(func.count())
+        .select_from(base_query.subquery())
+    ) or 0
+
+    severity_rows = db.execute(
+        select(Finding.severity, func.count(Finding.id))
+        .join(Scan, Finding.scan_id == Scan.id)
+        .join(Repository, Scan.repository_id == Repository.id)
         .where(Repository.owner_id == current_user.id)
-        .order_by(Finding.created_at.desc())
+        .group_by(Finding.severity)
     ).all()
 
+    status_rows = db.execute(
+        select(Finding.status, func.count(Finding.id))
+        .join(Scan, Finding.scan_id == Scan.id)
+        .join(Repository, Scan.repository_id == Repository.id)
+        .where(Repository.owner_id == current_user.id)
+        .group_by(Finding.status)
+    ).all()
 
-@router.get("/{finding_id}", response_model=FindingResponse)
+    by_severity = {key: 0 for key in SEVERITIES}
+    by_status = {key: 0 for key in STATUSES}
+
+    for severity, count in severity_rows:
+        by_severity[severity] = count
+
+    for finding_status, count in status_rows:
+        by_status[finding_status] = count
+
+    return {
+        "total": total,
+        "by_severity": by_severity,
+        "by_status": by_status
+    }
+
+
+@router.get(
+    "/",
+    response_model=FindingListResponse
+)
+def get_findings(
+    severity: str | None = Query(
+        default=None,
+        pattern="^(critical|high|medium|low|info)$"
+    ),
+    finding_status: str | None = Query(
+        default=None,
+        alias="status",
+        pattern="^(open|in_progress|resolved|false_positive)$"
+    ),
+    scan_id: uuid.UUID | None = None,
+    repository_id: uuid.UUID | None = None,
+    search: str | None = Query(default=None, max_length=100),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    query = _apply_filters(
+        _finding_query(current_user),
+        severity,
+        finding_status,
+        scan_id,
+        repository_id,
+        search
+    )
+
+    count_query = select(func.count()).select_from(
+        query.order_by(None).subquery()
+    )
+
+    total = db.scalar(count_query) or 0
+
+    findings = db.scalars(
+        query
+        .order_by(Finding.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+    return {
+        "items": findings,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+
+@router.get(
+    "/{finding_id}",
+    response_model=FindingResponse
+)
 def get_finding(
     finding_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     finding = db.scalar(
-        select(Finding)
-        .join(Scan)
-        .join(Repository)
-        .where(
-            Finding.id == finding_id,
-            Repository.owner_id == current_user.id
-        )
+        _finding_query(current_user)
+        .where(Finding.id == finding_id)
     )
 
     if not finding:
-        raise HTTPException(status_code=404, detail="Finding not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Finding not found"
+        )
 
     return finding
 
 
-@router.patch("/{finding_id}/status", response_model=FindingResponse)
+@router.patch(
+    "/{finding_id}/status",
+    response_model=FindingResponse
+)
 def update_finding_status(
     finding_id: uuid.UUID,
     status_data: FindingStatusUpdate,
@@ -94,17 +238,15 @@ def update_finding_status(
     current_user: User = Depends(get_current_user)
 ):
     finding = db.scalar(
-        select(Finding)
-        .join(Scan)
-        .join(Repository)
-        .where(
-            Finding.id == finding_id,
-            Repository.owner_id == current_user.id
-        )
+        _finding_query(current_user)
+        .where(Finding.id == finding_id)
     )
 
     if not finding:
-        raise HTTPException(status_code=404, detail="Finding not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Finding not found"
+        )
 
     finding.status = status_data.status
 
@@ -113,6 +255,12 @@ def update_finding_status(
         db.refresh(finding)
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Unable to update finding")
+        raise HTTPException(
+            status_code=409,
+            detail="Unable to update finding"
+        )
 
     return finding
+
+
+findings_router = router

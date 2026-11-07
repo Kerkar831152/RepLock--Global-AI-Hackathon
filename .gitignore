@@ -1,47 +1,53 @@
-
-# Python virtual environment
-replock_env/
-.venv/
-venv/
-
-# Python cache
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Environment variables
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
 
-# Node dependencies
-node_modules/
+# Python virtual environments
+replock_env/
+semgrep_env/
+.venv/
+venv/
+env/
 
-# Build files
-dist/
-build/
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Logs
 *.log
-npm-debug.log*
 
-# IDE
+# IDE and editor
 .vscode/
 .idea/
 
-# OS
+# Frontend dependencies and build
+node_modules/
+dist/
+build/
+
+# OS generated files
 .DS_Store
 Thumbs.db
-
-# Testing
-coverage/
-htmlcov/
 
 # Temporary files
 *.tmp
 *.bak
+temp/
+tmp/
 
-# Jupyter
-.ipynb_checkpoints/
+# Semgrep generated files
+.semgrep/
+.semgrep-cache/
+semgrep.sarif
+semgrep-results.json
+
+# Alembic / database local files
+*.db
+*.sqlite3

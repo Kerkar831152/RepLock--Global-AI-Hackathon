@@ -10,6 +10,7 @@ Severity = Literal["critical", "high", "medium", "low", "info"]
 class CodeFileInput(BaseModel):
     path: str = Field(min_length=1, max_length=300)
     content: str = Field(min_length=1, max_length=4000)
+    start_line: int = Field(default=1, ge=1)
 
 
 class ScannerSignalInput(BaseModel):
