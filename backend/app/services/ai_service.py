@@ -1,5 +1,5 @@
-import asyncio
 
+import asyncio
 import httpx
 
 from app.core.config import settings
@@ -43,9 +43,13 @@ class AIService:
                 max_tokens
                 if max_tokens is not None
                 else settings.AI_MAX_TOKENS
-            ),
-            "stream": False
-        }
+                ),
+                "reasoning_effort": "none",
+                "response_format": {
+                    "type": "json_object"
+                    },
+                    "stream": False
+                    }
 
         async with self.semaphore:
             response = await self.client.post(
@@ -54,10 +58,15 @@ class AIService:
             )
 
             response.raise_for_status()
-
             data = response.json()
 
-            return data["choices"][0]["message"]["content"]
+            print(
+                "BIFROST RESPONSE:",
+                repr(data.get("choices", []))[:4000]
+            )
+
+            message = data["choices"][0]["message"]
+            return message.get("content") or ""
 
     async def check_connection(self) -> bool:
         if not settings.BIFROST_API_KEY:

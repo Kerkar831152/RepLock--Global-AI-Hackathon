@@ -19,7 +19,7 @@ class Settings:
         "ollama/qwen3.5:4b"
     )
 
-    AI_TIMEOUT = 90.0
+    AI_TIMEOUT = 180.0
     AI_MAX_TOKENS = 512
     AI_MAX_CONCURRENT_REQUESTS = 1
 

@@ -35,6 +35,11 @@ class SecurityAnalysisRequest(BaseModel):
         default_factory=list,
         max_length=3
     )
+    research_query: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=300
+    )
 
     @model_validator(mode="after")
     def validate_total_code_size(self):
@@ -48,6 +53,11 @@ class SecurityAnalysisRequest(BaseModel):
         return self
 
 
+class SecurityReference(BaseModel):
+    title: str = Field(max_length=200)
+    url: str = Field(max_length=1000)
+
+
 class SecurityFinding(BaseModel):
     title: str
     vulnerability_type: str
@@ -59,7 +69,7 @@ class SecurityFinding(BaseModel):
     evidence: str
     description: str
     remediation: str
-    references: list[str] = Field(default_factory=list)
+    references: list[SecurityReference] = Field(default_factory=list)
 
 
 class SecurityAnalysisResponse(BaseModel):
