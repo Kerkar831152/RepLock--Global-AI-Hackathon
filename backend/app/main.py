@@ -1,20 +1,26 @@
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.auth import router as auth_router
-from app.api.ai import router as ai_router
-from app.api.findings import router as findings_router
 from app.api.repositories import router as repositories_router
 from app.api.scans import router as scans_router
+from app.api.findings import router as findings_router
+from app.api.auth import router as auth_router
+from app.api.ai import router as ai_router
+from app.api.research import router as research_router
+
 from app.services.ai_service import ai_service
+from app.services.research_service import research_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
+
     await ai_service.close()
+    await research_service.close()
 
 
 app = FastAPI(
@@ -35,16 +41,20 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
-app.include_router(auth_router, prefix="/api/v1")
-app.include_router(ai_router, prefix="/api/v1")
 app.include_router(repositories_router, prefix="/api/v1")
 app.include_router(scans_router, prefix="/api/v1")
 app.include_router(findings_router, prefix="/api/v1")
+app.include_router(auth_router, prefix="/api/v1")
+app.include_router(ai_router, prefix="/api/v1")
+app.include_router(research_router, prefix="/api/v1")
 
 
 @app.get("/")
 def home():
-    return {"message": "Welcome to RepLock API", "status": "running"}
+    return {
+        "message": "Welcome to RepLock API",
+        "status": "running"
+    }
 
 
 @app.get("/health")
