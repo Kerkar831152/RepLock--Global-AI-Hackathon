@@ -1,4 +1,3 @@
-
 fastapi
 uvicorn[standard]
 python-dotenv
@@ -10,3 +9,4 @@ email-validator
 httpx==0.28.1
 python-jose[cryptography]
 cryptography
+tree-sitter-language-pack==1.25.0
