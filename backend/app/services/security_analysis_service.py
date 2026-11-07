@@ -7,10 +7,7 @@ from app.schemas.security_analysis import (
     ResearchSourceInput
 )
 from app.services.ai_service import ai_service
-from app.services.research_service import (
-    research_service,
-    TavilyError
-)
+from app.services.research_service import research_service, TavilyError
 
 
 class SecurityAnalysisError(Exception):
@@ -42,6 +39,9 @@ Rules:
 15. Return only one complete valid JSON object.
 16. Keep descriptions and remediation concise.
 17. Do not report scanner findings without independently checking the code.
+18. Do not report a vulnerability merely because a scanner labels it.
+19. Use the exact submitted file path.
+20. Do not invent a fix that is unrelated to the demonstrated vulnerability.
 
 Required JSON structure:
 
@@ -80,11 +80,6 @@ Required JSON structure:
             item.path: item for item in request.files
         }
 
-        if len(files_by_path) != len(request.files):
-            raise SecurityAnalysisError(
-                "Duplicate file paths are not allowed"
-            )
-
         research_sources = list(request.research_sources)
         limitations = []
 
@@ -95,18 +90,25 @@ Required JSON structure:
                     max_results=3
                 )
 
-                research_sources.extend([
-                    ResearchSourceInput(
-                        title=item["title"],
-                        url=item["url"],
-                        content=item["content"][:1000]
+                for item in research_result.get("results", []):
+                    if len(research_sources) >= 3:
+                        break
+
+                    research_sources.append(
+                        ResearchSourceInput(
+                            title=item["title"][:200],
+                            url=item["url"][:1000],
+                            content=item["content"][:1000]
+                        )
                     )
-                    for item in research_result["results"]
-                ])
 
             except TavilyError:
                 limitations.append(
                     "External security research was unavailable"
+                )
+            except (KeyError, TypeError, ValueError):
+                limitations.append(
+                    "Some external research results were invalid"
                 )
 
         research_sources = research_sources[:3]
@@ -160,6 +162,9 @@ Required JSON structure:
                 max_tokens=3000
             )
 
+            if not isinstance(raw_response, str):
+                raise ValueError("AI response must be text")
+
             start = raw_response.find("{")
 
             if start == -1:
@@ -193,6 +198,7 @@ Required JSON structure:
 
         valid_findings = []
         limitations = list(result.limitations)
+        seen_findings = set()
 
         allowed_references = {
             source.url for source in research_sources
@@ -201,7 +207,7 @@ Required JSON structure:
         for finding in result.findings:
             source = files_by_path.get(finding.file_path)
 
-            if not source:
+            if source is None:
                 limitations.append(
                     "Rejected finding with unknown file path: "
                     + finding.file_path
@@ -231,13 +237,8 @@ Required JSON structure:
                 relative_start:relative_end + 1
             ]
 
-            evidence_text = " ".join(
-                finding.evidence.split()
-            )
-
-            actual_text = " ".join(
-                " ".join(evidence_lines).split()
-            )
+            evidence_text = " ".join(finding.evidence.split())
+            actual_text = " ".join(" ".join(evidence_lines).split())
 
             if (
                 not evidence_text
@@ -248,6 +249,19 @@ Required JSON structure:
                     + finding.file_path
                 )
                 continue
+
+            finding_key = (
+                finding.file_path,
+                finding.line_start,
+                finding.line_end,
+                finding.vulnerability_type.casefold(),
+                evidence_text
+            )
+
+            if finding_key in seen_findings:
+                continue
+
+            seen_findings.add(finding_key)
 
             finding.references = [
                 reference
