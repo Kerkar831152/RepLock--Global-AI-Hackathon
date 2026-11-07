@@ -1,5 +1,6 @@
 
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -18,7 +19,6 @@ from app.schemas.finding import (
 )
 
 router = APIRouter(prefix="/findings", tags=["Findings"])
-
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 STATUSES = ("open", "in_progress", "resolved", "false_positive")
@@ -39,7 +39,10 @@ def _apply_filters(
     finding_status,
     scan_id,
     repository_id,
-    search
+    vulnerability_type,
+    search,
+    date_from,
+    date_to
 ):
     if severity:
         query = query.where(Finding.severity == severity)
@@ -53,13 +56,26 @@ def _apply_filters(
     if repository_id:
         query = query.where(Scan.repository_id == repository_id)
 
+    if vulnerability_type:
+        query = query.where(
+            Finding.vulnerability_type.ilike(f"%{vulnerability_type.strip()}%")
+        )
+
     if search:
         term = f"%{search.strip()}%"
         query = query.where(
             Finding.title.ilike(term)
             | Finding.description.ilike(term)
             | Finding.file_path.ilike(term)
+            | Finding.vulnerability_type.ilike(term)
+            | Finding.evidence.ilike(term)
         )
+
+    if date_from:
+        query = query.where(Finding.created_at >= date_from)
+
+    if date_to:
+        query = query.where(Finding.created_at <= date_to)
 
     return query
 
@@ -84,10 +100,7 @@ def create_finding(
     )
 
     if not scan:
-        raise HTTPException(
-            status_code=404,
-            detail="Scan not found"
-        )
+        raise HTTPException(status_code=404, detail="Scan not found")
 
     new_finding = Finding(**finding_data.model_dump())
     db.add(new_finding)
@@ -105,10 +118,7 @@ def create_finding(
     return new_finding
 
 
-@router.get(
-    "/summary",
-    response_model=FindingSummaryResponse
-)
+@router.get("/summary", response_model=FindingSummaryResponse)
 def get_finding_summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -116,34 +126,23 @@ def get_finding_summary(
     base_query = _finding_query(current_user)
 
     total = db.scalar(
-        select(func.count())
-        .select_from(base_query.subquery())
+        select(func.count()).select_from(base_query.subquery())
     ) or 0
 
-    severity_rows = db.execute(
-        select(Finding.severity, func.count(Finding.id))
+    grouped_rows = db.execute(
+        select(Finding.severity, Finding.status, func.count(Finding.id))
         .join(Scan, Finding.scan_id == Scan.id)
         .join(Repository, Scan.repository_id == Repository.id)
         .where(Repository.owner_id == current_user.id)
-        .group_by(Finding.severity)
-    ).all()
-
-    status_rows = db.execute(
-        select(Finding.status, func.count(Finding.id))
-        .join(Scan, Finding.scan_id == Scan.id)
-        .join(Repository, Scan.repository_id == Repository.id)
-        .where(Repository.owner_id == current_user.id)
-        .group_by(Finding.status)
+        .group_by(Finding.severity, Finding.status)
     ).all()
 
     by_severity = {key: 0 for key in SEVERITIES}
     by_status = {key: 0 for key in STATUSES}
 
-    for severity, count in severity_rows:
-        by_severity[severity] = count
-
-    for finding_status, count in status_rows:
-        by_status[finding_status] = count
+    for severity, finding_status, count in grouped_rows:
+        by_severity[severity] += count
+        by_status[finding_status] += count
 
     return {
         "total": total,
@@ -152,10 +151,7 @@ def get_finding_summary(
     }
 
 
-@router.get(
-    "/",
-    response_model=FindingListResponse
-)
+@router.get("/", response_model=FindingListResponse)
 def get_findings(
     severity: str | None = Query(
         default=None,
@@ -168,30 +164,42 @@ def get_findings(
     ),
     scan_id: uuid.UUID | None = None,
     repository_id: uuid.UUID | None = None,
+    vulnerability_type: str | None = Query(default=None, max_length=100),
     search: str | None = Query(default=None, max_length=100),
+    date_from: datetime | None = None,
+    date_to: datetime | None = None,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(
+            status_code=400,
+            detail="date_from cannot be later than date_to"
+        )
+
     query = _apply_filters(
         _finding_query(current_user),
         severity,
         finding_status,
         scan_id,
         repository_id,
-        search
+        vulnerability_type,
+        search,
+        date_from,
+        date_to
     )
 
-    count_query = select(func.count()).select_from(
-        query.order_by(None).subquery()
-    )
-
-    total = db.scalar(count_query) or 0
+    total = db.scalar(
+        select(func.count()).select_from(
+            query.order_by(None).subquery()
+        )
+    ) or 0
 
     findings = db.scalars(
         query
-        .order_by(Finding.created_at.desc())
+        .order_by(Finding.created_at.desc(), Finding.id.desc())
         .limit(limit)
         .offset(offset)
     ).all()
@@ -204,25 +212,18 @@ def get_findings(
     }
 
 
-@router.get(
-    "/{finding_id}",
-    response_model=FindingResponse
-)
+@router.get("/{finding_id}", response_model=FindingResponse)
 def get_finding(
     finding_id: uuid.UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
     finding = db.scalar(
-        _finding_query(current_user)
-        .where(Finding.id == finding_id)
+        _finding_query(current_user).where(Finding.id == finding_id)
     )
 
     if not finding:
-        raise HTTPException(
-            status_code=404,
-            detail="Finding not found"
-        )
+        raise HTTPException(status_code=404, detail="Finding not found")
 
     return finding
 
@@ -238,15 +239,11 @@ def update_finding_status(
     current_user: User = Depends(get_current_user)
 ):
     finding = db.scalar(
-        _finding_query(current_user)
-        .where(Finding.id == finding_id)
+        _finding_query(current_user).where(Finding.id == finding_id)
     )
 
     if not finding:
-        raise HTTPException(
-            status_code=404,
-            detail="Finding not found"
-        )
+        raise HTTPException(status_code=404, detail="Finding not found")
 
     finding.status = status_data.status
 
