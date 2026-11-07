@@ -1,10 +1,9 @@
-
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -65,6 +64,58 @@ def get_github_token(user: User) -> str:
             status_code=500,
             detail="Unable to decrypt GitHub access token"
         )
+
+
+def get_existing_review(
+    db: Session,
+    repository_id: uuid.UUID,
+    number: int,
+    head_sha: str
+) -> Scan | None:
+
+    return db.scalar(
+        select(Scan)
+        .where(
+            Scan.repository_id == repository_id,
+            Scan.pull_request_number == number,
+            Scan.commit_sha == head_sha,
+            Scan.scan_type == "pull_request",
+            Scan.status.in_(["running", "completed"])
+        )
+        .limit(1)
+    )
+
+
+def build_existing_review_response(
+    db: Session,
+    scan: Scan,
+    number: int,
+    pull_request_url: str
+) -> PullRequestReviewResponse:
+
+    findings = db.scalars(
+        select(Finding)
+        .where(Finding.scan_id == scan.id)
+        .order_by(Finding.created_at.asc(), Finding.id.asc())
+    ).all()
+
+    return PullRequestReviewResponse(
+        scan_id=scan.id,
+        pull_request_number=number,
+        pull_request_url=pull_request_url,
+        head_sha=scan.commit_sha,
+        status=scan.status,
+        summary=scan.summary or "",
+        files_analyzed=scan.files_analyzed or 0,
+        findings=[
+            FindingResponse.model_validate(item)
+            for item in findings
+        ],
+        limitations=[
+            "This pull request commit has already been reviewed. "
+            "The previously saved review is being returned."
+        ]
+    )
 
 
 def mark_scan_failed(db: Session, scan_id: uuid.UUID):
@@ -137,9 +188,44 @@ async def review_pull_request(
 
     token = get_github_token(current_user)
 
+    try:
+        metadata = await pull_request_service.get_pull_request_metadata(
+            repository.full_name,
+            number,
+            token
+        )
+    except PullRequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=str(exc)
+        )
+
+    existing = get_existing_review(
+        db,
+        repository.id,
+        number,
+        metadata["head_sha"]
+    )
+
+    if existing:
+        if existing.status == "completed":
+            return build_existing_review_response(
+                db,
+                existing,
+                number,
+                metadata["html_url"]
+            )
+
+        raise HTTPException(
+            status_code=409,
+            detail="A review for this pull request commit is already running."
+        )
+
     scan = Scan(
         repository_id=repository.id,
-        commit_sha=None,
+        commit_sha=metadata["head_sha"],
+        pull_request_number=number,
+        files_analyzed=0,
         status="running",
         scan_type="pull_request",
         summary="Pull request security review in progress",
@@ -151,23 +237,50 @@ async def review_pull_request(
     try:
         db.commit()
         db.refresh(scan)
-    except SQLAlchemyError:
+
+    except IntegrityError:
         db.rollback()
+
+        existing = get_existing_review(
+            db,
+            repository.id,
+            number,
+            metadata["head_sha"]
+        )
+
+        if existing and existing.status == "completed":
+            return build_existing_review_response(
+                db,
+                existing,
+                number,
+                metadata["html_url"]
+            )
+
+        raise HTTPException(
+            status_code=409,
+            detail="A review for this pull request commit is already running."
+        )
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+
         raise HTTPException(
             status_code=500,
             detail="Unable to create pull request review"
-        )
+        ) from exc
 
     try:
         review = await pull_request_service.review_pull_request(
             repository.full_name,
             number,
-            token
+            token,
+            metadata=metadata
         )
 
         analysis = review["analysis"]
 
         scan.commit_sha = review["head_sha"]
+        scan.files_analyzed = review["files_analyzed"]
         scan.summary = analysis.summary
         scan.status = "completed"
         scan.completed_at = datetime.now(timezone.utc)

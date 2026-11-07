@@ -1,4 +1,3 @@
-
 import re
 from urllib.parse import quote
 
@@ -6,7 +5,6 @@ import httpx
 
 from app.schemas.security_analysis import (
     CodeFileInput,
-    ScannerSignalInput,
     SecurityAnalysisRequest
 )
 from app.services.security_analysis_service import (
@@ -22,10 +20,20 @@ class PullRequestError(Exception):
 class PullRequestService:
 
     GITHUB_API = "https://api.github.com"
+
     MAX_FILES = 3
     MAX_FILE_CHARS = 4000
     MAX_TOTAL_CHARS = 8000
-    MAX_DIFF_FILES = 30
+
+    MAX_DIFF_FILES = 300
+    FILES_PER_PAGE = 100
+
+    PRIORITY_NAMES = (
+        "auth", "login", "user", "route", "api",
+        "database", "db", "security", "config",
+        "payment", "admin", "permission", "token",
+        "session", "crypto"
+    )
 
     def _headers(self, token: str) -> dict:
         return {
@@ -116,6 +124,38 @@ class PullRequestService:
             for item in result
         ]
 
+    async def get_pull_request_metadata(
+        self,
+        full_name: str,
+        number: int,
+        token: str
+    ) -> dict:
+
+        repository = quote(full_name, safe="/")
+        url = f"{self.GITHUB_API}/repos/{repository}/pulls/{number}"
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(20, connect=5)
+        ) as client:
+            pull_request = await self._get(
+                client,
+                url,
+                token
+            )
+
+        if pull_request.get("state") != "open":
+            raise PullRequestError(
+                "Only open pull requests can be reviewed."
+            )
+
+        return {
+            "number": number,
+            "state": pull_request["state"],
+            "head_sha": pull_request["head"]["sha"],
+            "html_url": pull_request["html_url"],
+            "changed_files": pull_request.get("changed_files", 0)
+        }
+
     def _extract_hunk(
         self,
         patch: str,
@@ -137,8 +177,6 @@ class PullRequestService:
             expected_lines = int(match.group(2) or 1)
 
             source_lines = []
-            current_line = start_line
-            consumed = 0
             total_chars = 0
 
             for diff_line in lines[index + 1:]:
@@ -162,10 +200,8 @@ class PullRequestService:
 
                 source_lines.append(source_line)
                 total_chars += len(source_line) + 1
-                current_line += 1
-                consumed += 1
 
-                if consumed >= expected_lines:
+                if len(source_lines) >= expected_lines:
                     break
 
             if not source_lines:
@@ -179,12 +215,69 @@ class PullRequestService:
 
         return None
 
+    def _file_priority(self, item: dict) -> tuple:
+        path = item.get("filename", "").lower()
+
+        priority = sum(
+            1 for name in self.PRIORITY_NAMES
+            if name in path
+        )
+
+        changes = item.get("additions", 0) + item.get("deletions", 0)
+
+        return (-priority, -changes, path)
+
+    async def _get_changed_files(
+        self,
+        client: httpx.AsyncClient,
+        base_url: str,
+        token: str
+    ) -> list[dict]:
+
+        all_files = []
+
+        for page in range(1, 4):
+            remaining = self.MAX_DIFF_FILES - len(all_files)
+
+            if remaining <= 0:
+                break
+
+            page_size = min(self.FILES_PER_PAGE, remaining)
+
+            result = await self._get(
+                client,
+                f"{base_url}/files",
+                token,
+                params={
+                    "per_page": page_size,
+                    "page": page
+                }
+            )
+
+            if not result:
+                break
+
+            all_files.extend(result)
+
+            if len(result) < page_size:
+                break
+
+        return all_files
+
     async def review_pull_request(
         self,
         full_name: str,
         number: int,
-        token: str
+        token: str,
+        metadata: dict | None = None
     ):
+
+        if metadata is None:
+            metadata = await self.get_pull_request_metadata(
+                full_name,
+                number,
+                token
+            )
 
         repository = quote(full_name, safe="/")
         base_url = f"{self.GITHUB_API}/repos/{repository}/pulls/{number}"
@@ -192,46 +285,32 @@ class PullRequestService:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(30, connect=5)
         ) as client:
-            pull_request = await self._get(
+            files = await self._get_changed_files(
                 client,
                 base_url,
                 token
             )
 
-            if pull_request.get("state") != "open":
-                raise PullRequestError(
-                    "Only open pull requests can be reviewed."
-                )
+        candidates = [
+            item for item in files
+            if item.get("status") != "removed"
+            and item.get("additions", 0) + item.get("deletions", 0) > 0
+            and item.get("patch")
+            and item.get("filename")
+        ]
 
-            files = await self._get(
-                client,
-                f"{base_url}/files",
-                token,
-                params={"per_page": self.MAX_DIFF_FILES}
-            )
+        candidates.sort(key=self._file_priority)
 
         selected_files = []
-        scanner_signals = []
         total_chars = 0
 
-        for item in files:
+        for item in candidates:
             if len(selected_files) >= self.MAX_FILES:
                 break
 
-            if item.get("status") == "removed":
-                continue
-
-            if item.get("additions", 0) + item.get("deletions", 0) == 0:
-                continue
-
-            patch = item.get("patch")
-
-            if not patch:
-                continue
-
             try:
                 code_file = self._extract_hunk(
-                    patch,
+                    item["patch"],
                     item["filename"]
                 )
             except ValueError:
@@ -257,19 +336,6 @@ class PullRequestService:
             selected_files.append(code_file)
             total_chars += len(code_file.content)
 
-            scanner_signals.append(
-                ScannerSignalInput(
-                    title="Pull request code change",
-                    description=(
-                        f"This file was modified in the pull request. "
-                        f"GitHub reports {item.get('additions', 0)} additions "
-                        f"and {item.get('deletions', 0)} deletions. "
-                        "Review the submitted code for security implications."
-                    ),
-                    file_path=item["filename"]
-                )
-            )
-
         if not selected_files:
             raise PullRequestError(
                 "No supported code diff hunks were available for analysis."
@@ -278,8 +344,7 @@ class PullRequestService:
         try:
             analysis = await security_analysis_service.analyze(
                 SecurityAnalysisRequest(
-                    files=selected_files,
-                    scanner_findings=scanner_signals[:5]
+                    files=selected_files
                 )
             )
         except SecurityAnalysisError as exc:
@@ -288,14 +353,32 @@ class PullRequestService:
             ) from exc
 
         limitations = list(analysis.limitations)
+
         limitations.append(
-            "MVP review analyses at most three files and the first diff "
-            "hunk from each selected file."
+            "The review analyses at most three selected files and the first "
+            "diff hunk from each selected file."
         )
 
+        if metadata["changed_files"] > self.MAX_DIFF_FILES:
+            limitations.append(
+                f"GitHub reported {metadata['changed_files']} changed files. "
+                f"Only the first {self.MAX_DIFF_FILES} were considered."
+            )
+
+        if len(candidates) > self.MAX_FILES:
+            limitations.append(
+                "Only three files are sent to the AI. Security-sensitive "
+                "paths and larger changes are prioritised."
+            )
+
+        if len(files) < metadata["changed_files"] and len(files) < self.MAX_DIFF_FILES:
+            limitations.append(
+                "GitHub did not return all files reported in the pull request."
+            )
+
         return {
-            "head_sha": pull_request["head"]["sha"],
-            "html_url": pull_request["html_url"],
+            "head_sha": metadata["head_sha"],
+            "html_url": metadata["html_url"],
             "analysis": analysis,
             "files_analyzed": len(selected_files),
             "limitations": list(dict.fromkeys(limitations))
