@@ -1,17 +1,34 @@
-import { api } from './api'
+import { api, API_ROOT } from './api'
 
-interface GithubAuthorizationResponse {
-  authorization_url: string
+export interface CurrentUser {
+  id: string
+  github_id: string
+  username: string
+  email: string | null
+  created_at: string
 }
 
+const TOKEN_KEY = 'replock_access_token'
+
 export const authService = {
-  async beginGithubOAuth(): Promise<void> {
-    const { data } = await api.get<GithubAuthorizationResponse>('/auth/github')
-    if (!data.authorization_url) throw new Error('The API did not return a GitHub authorization URL.')
-    const destination = new URL(data.authorization_url, window.location.origin)
-    if (!['http:', 'https:'].includes(destination.protocol)) {
-      throw new Error('The API returned an invalid GitHub authorization URL.')
-    }
-    window.location.assign(destination.toString())
+  beginGithubOAuth(): void {
+    window.location.assign(`${API_ROOT}/api/v1/auth/github/login`)
+  },
+
+  getAccessToken(): string | null {
+    return sessionStorage.getItem(TOKEN_KEY)
+  },
+
+  storeAccessToken(token: string): void {
+    sessionStorage.setItem(TOKEN_KEY, token)
+  },
+
+  clearAccessToken(): void {
+    sessionStorage.removeItem(TOKEN_KEY)
+  },
+
+  async getCurrentUser(): Promise<CurrentUser> {
+    const { data } = await api.get<CurrentUser>('/auth/me')
+    return data
   },
 }

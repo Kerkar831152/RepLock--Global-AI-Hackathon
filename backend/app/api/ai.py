@@ -1,5 +1,7 @@
+
 from fastapi import APIRouter, HTTPException
 
+from app.core.config import settings
 from app.services.ai_service import ai_service
 
 router = APIRouter(prefix="/ai", tags=["AI"])
@@ -19,7 +21,7 @@ async def ai_health():
         return {
             "status": "healthy",
             "provider": "Bifrost",
-            "model": "qwen3.5:4b"
+            "model": settings.AI_MODEL
         }
 
     except HTTPException:

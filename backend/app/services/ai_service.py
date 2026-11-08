@@ -1,3 +1,4 @@
+
 import asyncio
 import httpx
 
@@ -6,12 +7,16 @@ from app.core.config import settings
 
 class AIService:
     def __init__(self):
+        headers = {
+            "Content-Type": "application/json"
+        }
+
+        if settings.BIFROST_API_KEY:
+            headers["x-bf-vk"] = settings.BIFROST_API_KEY
+
         self.client = httpx.AsyncClient(
             base_url=settings.BIFROST_BASE_URL,
-            headers={
-                "x-bf-vk": settings.BIFROST_API_KEY,
-                "Content-Type": "application/json"
-            },
+            headers=headers,
             timeout=httpx.Timeout(
                 settings.AI_TIMEOUT,
                 connect=5.0
@@ -24,7 +29,7 @@ class AIService:
         )
 
         self.semaphore = asyncio.Semaphore(
-            settings.AI_MAX_CONCURRENT_REQUESTS
+            max(1, settings.AI_MAX_CONCURRENT_REQUESTS)
         )
 
     async def generate(
@@ -35,14 +40,19 @@ class AIService:
         if not settings.BIFROST_API_KEY:
             raise RuntimeError("BIFROST_API_KEY is missing")
 
+        token_limit = (
+            max_tokens
+            if max_tokens is not None
+            else settings.AI_MAX_TOKENS
+        )
+
+        if token_limit <= 0:
+            raise ValueError("max_tokens must be greater than zero")
+
         payload = {
             "model": settings.AI_MODEL,
             "messages": messages,
-            "max_tokens": (
-                max_tokens
-                if max_tokens is not None
-                else settings.AI_MAX_TOKENS
-            ),
+            "max_tokens": token_limit,
             "reasoning_effort": "none",
             "response_format": {
                 "type": "json_object"
@@ -57,32 +67,72 @@ class AIService:
             )
 
             response.raise_for_status()
-            data = response.json()
 
-            choices = data.get("choices", [])
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Bifrost returned invalid JSON"
+                ) from exc
 
-            if not choices:
-                raise RuntimeError("Bifrost returned no AI response")
+            if not isinstance(data, dict):
+                raise RuntimeError(
+                    "Bifrost returned an invalid response"
+                )
 
-            message = choices[0].get("message", {})
-            return message.get("content") or ""
+            choices = data.get("choices")
+
+            if not isinstance(choices, list) or not choices:
+                raise RuntimeError(
+                    "Bifrost returned no AI response"
+                )
+
+            message = choices[0].get("message")
+
+            if not isinstance(message, dict):
+                raise RuntimeError(
+                    "Bifrost returned an invalid message"
+                )
+
+            content = message.get("content")
+
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError(
+                    "Bifrost returned empty AI content"
+                )
+
+            return content
 
     async def check_connection(self) -> bool:
         if not settings.BIFROST_API_KEY:
             return False
 
-        response = await self.client.get("/v1/models")
-        response.raise_for_status()
+        async with self.semaphore:
+            response = await self.client.get("/v1/models")
+            response.raise_for_status()
 
-        models = response.json().get("data", [])
+            try:
+                data = response.json()
+            except ValueError:
+                return False
 
-        return any(
-            model.get("id") == settings.AI_MODEL
-            for model in models
-        )
+            if not isinstance(data, dict):
+                return False
+
+            models = data.get("data", [])
+
+            if not isinstance(models, list):
+                return False
+
+            return any(
+                isinstance(model, dict)
+                and model.get("id") == settings.AI_MODEL
+                for model in models
+            )
 
     async def close(self):
-        await self.client.aclose()
+        if not self.client.is_closed:
+            await self.client.aclose()
 
 
 ai_service = AIService()

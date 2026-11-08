@@ -12,15 +12,49 @@ class SemgrepError(Exception):
 
 
 class SemgrepService:
-
     SEVERITY_MAP = {
         "ERROR": "high",
         "WARNING": "medium",
-        "INFO": "low"
+        "INFO": "low",
     }
 
     MAX_OUTPUT_SIZE = 5 * 1024 * 1024
     MAX_FINDINGS = 1000
+
+    async def _stop_process(self, process):
+        if process and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
+            await process.wait()
+
+    def _normalize_path(self, raw_path: str, root: Path) -> str | None:
+        if not raw_path:
+            return None
+
+        raw_path = raw_path.replace("\\", "/")
+        path = PurePosixPath(raw_path)
+
+        if path.is_absolute():
+            try:
+                resolved = Path(raw_path).resolve()
+                relative = resolved.relative_to(root)
+            except (OSError, ValueError):
+                return None
+
+            normalized = relative.as_posix()
+        else:
+            if ".." in path.parts:
+                return None
+
+            normalized = path.as_posix().removeprefix("./")
+
+        if not normalized or normalized == ".":
+            return None
+
+        return normalized
 
     async def scan(self, repository_path: str) -> dict:
         executable = Path(settings.SEMGREP_PATH).resolve()
@@ -33,7 +67,7 @@ class SemgrepService:
 
         if not root.is_dir():
             raise SemgrepError(
-                "Repository directory does not exist"
+                "Repository directory does not exist."
             )
 
         command = [
@@ -46,7 +80,7 @@ class SemgrepService:
             "--no-git-ignore",
             "--jobs", "1",
             "--timeout", "10",
-            str(root)
+            str(root),
         ]
 
         process = None
@@ -58,21 +92,18 @@ class SemgrepService:
                         *command,
                         cwd=str(root),
                         stdout=stdout_file,
-                        stderr=stderr_file
+                        stderr=stderr_file,
                     )
 
                     try:
                         await asyncio.wait_for(
                             process.wait(),
-                            timeout=settings.SEMGREP_TIMEOUT
+                            timeout=settings.SEMGREP_TIMEOUT,
                         )
-
                     except asyncio.TimeoutError as exc:
-                        process.kill()
-                        await process.wait()
-
+                        await self._stop_process(process)
                         raise SemgrepError(
-                            "Semgrep scan exceeded its time limit"
+                            "Semgrep scan exceeded its time limit."
                         ) from exc
 
                     stdout_file.seek(0, 2)
@@ -80,7 +111,7 @@ class SemgrepService:
 
                     if output_size > self.MAX_OUTPUT_SIZE:
                         raise SemgrepError(
-                            "Semgrep output exceeded the allowed size"
+                            "Semgrep output exceeded the allowed size."
                         )
 
                     stdout_file.seek(0)
@@ -89,65 +120,83 @@ class SemgrepService:
                     stderr_file.seek(0)
                     error_output = stderr_file.read(500).decode(
                         "utf-8",
-                        errors="replace"
+                        errors="replace",
                     )
 
         except SemgrepError:
             raise
 
-        except OSError as exc:
-            if process and process.returncode is None:
-                process.kill()
-                await process.wait()
+        except asyncio.CancelledError:
+            await self._stop_process(process)
+            raise
 
+        except OSError as exc:
+            await self._stop_process(process)
             raise SemgrepError(
-                "Unable to execute Semgrep"
+                "Unable to execute Semgrep."
             ) from exc
 
         if process.returncode not in (0, 1):
             raise SemgrepError(
-                "Semgrep execution failed: "
-                + error_output[:300]
+                "Semgrep execution failed: " + error_output[:300]
             )
 
         try:
             data = json.loads(output.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise SemgrepError(
-                "Semgrep returned invalid JSON"
+                "Semgrep returned invalid JSON."
             ) from exc
+
+        if not isinstance(data, dict):
+            raise SemgrepError(
+                "Semgrep returned an invalid response."
+            )
+
+        results = data.get("results", [])
+
+        if not isinstance(results, list):
+            raise SemgrepError(
+                "Semgrep returned an invalid findings list."
+            )
+
+        errors = data.get("errors", [])
+
+        if not isinstance(errors, list):
+            errors = []
 
         findings = []
 
-        for item in data.get("results", [])[:self.MAX_FINDINGS]:
+        for item in results[:self.MAX_FINDINGS]:
+            if not isinstance(item, dict):
+                continue
+
             extra = item.get("extra") or {}
+
+            if not isinstance(extra, dict):
+                extra = {}
+
             metadata = extra.get("metadata") or {}
+
+            if not isinstance(metadata, dict):
+                metadata = {}
+
             start = item.get("start") or {}
 
-            raw_path = str(item.get("path") or "").replace("\\", "/")
-            root_path = root.as_posix().rstrip("/")
-            root_lower = root_path.casefold()
-            raw_lower = raw_path.casefold()
+            if not isinstance(start, dict):
+                start = {}
 
-            if raw_lower == root_lower:
-                continue
+            normalized_path = self._normalize_path(
+                str(item.get("path") or ""),
+                root,
+            )
 
-            if raw_lower.startswith(root_lower + "/"):
-                raw_path = raw_path[len(root_path) + 1:]
-
-            relative_path = PurePosixPath(raw_path)
-
-            if relative_path.is_absolute() or ".." in relative_path.parts:
-                continue
-
-            normalized_path = relative_path.as_posix().removeprefix("./")
-
-            if not normalized_path or normalized_path == ".":
+            if not normalized_path:
                 continue
 
             severity = self.SEVERITY_MAP.get(
                 str(extra.get("severity", "WARNING")).upper(),
-                "medium"
+                "medium",
             )
 
             line_number = start.get("line", 1)
@@ -155,12 +204,14 @@ class SemgrepService:
             if not isinstance(line_number, int) or line_number < 1:
                 line_number = 1
 
+            message = str(
+                extra.get("message")
+                or item.get("check_id")
+                or "Security issue"
+            )
+
             findings.append({
-                "title": str(
-                    extra.get("message")
-                    or item.get("check_id")
-                    or "Security issue"
-                )[:200],
+                "title": message[:200],
                 "description": str(
                     extra.get("message")
                     or "Semgrep detected a potential security issue."
@@ -171,13 +222,13 @@ class SemgrepService:
                 "rule_id": str(item.get("check_id") or "")[:300],
                 "cwe": metadata.get("cwe"),
                 "confidence": metadata.get("confidence"),
-                "evidence": str(extra.get("lines") or "")[:1000]
+                "evidence": str(extra.get("lines") or "")[:1000],
             })
 
         return {
             "findings": findings,
-            "total_findings": len(data.get("results", [])),
-            "errors": data.get("errors", [])
+            "total_findings": len(results),
+            "errors": errors,
         }
 
 

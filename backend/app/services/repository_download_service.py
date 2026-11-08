@@ -1,6 +1,7 @@
 
 import asyncio
-import io
+import os
+import tempfile
 import tarfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
@@ -24,7 +25,7 @@ class RepositoryDownloadService:
         ".swift", ".dart", ".sql", ".html", ".css",
         ".vue", ".svelte", ".sh", ".yaml", ".yml",
         ".json", ".toml", ".ini", ".xml", ".conf",
-        ".properties"
+        ".properties",
     }
 
     ALLOWED_NAMES = {
@@ -36,187 +37,232 @@ class RepositoryDownloadService:
         "composer.json",
         "Gemfile",
         "go.mod",
-        "Cargo.toml"
+        "Cargo.toml",
     }
 
     IGNORED_DIRS = {
         ".git", "node_modules", "vendor", "dist",
         "build", ".venv", "venv", "__pycache__",
-        "coverage", ".next", "target"
+        "coverage", ".next", "target",
     }
 
     async def download(
         self,
         repository,
         access_token: str,
-        destination: Path
+        destination: Path,
     ) -> str:
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28"
+            "X-GitHub-Api-Version": "2022-11-28",
         }
 
         full_name = quote(repository.full_name, safe="/")
         branch = quote(repository.default_branch, safe="")
 
         timeout = httpx.Timeout(60, connect=10)
+        archive_fd, archive_name = tempfile.mkstemp(
+            prefix="replock_archive_",
+            suffix=".tar.gz",
+        )
+        os.close(archive_fd)
 
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=timeout
-        ) as client:
-            try:
-                commit_response = await client.get(
-                    f"{self.GITHUB_API}/repos/{full_name}/commits/{branch}",
-                    headers=headers
-                )
-                commit_response.raise_for_status()
-
-                commit_sha = commit_response.json()["sha"]
-
-                archive_url = (
-                    f"{self.GITHUB_API}/repos/{full_name}/tarball/{commit_sha}"
-                )
-
-                archive_data = bytearray()
-
-                async with client.stream(
-                    "GET",
-                    archive_url,
-                    headers=headers
-                ) as response:
-                    response.raise_for_status()
-
-                    content_length = response.headers.get("content-length")
-
-                    if (
-                        content_length
-                        and int(content_length)
-                        > settings.REPOSITORY_MAX_ARCHIVE_SIZE
-                    ):
-                        raise RepositoryDownloadError(
-                            "Repository archive exceeds the download size limit"
-                        )
-
-                    async for chunk in response.aiter_bytes():
-                        archive_data.extend(chunk)
-
-                        if len(archive_data) > settings.REPOSITORY_MAX_ARCHIVE_SIZE:
-                            raise RepositoryDownloadError(
-                                "Repository archive exceeds the download size limit"
-                            )
-
-            except RepositoryDownloadError:
-                raise
-
-            except httpx.HTTPStatusError as exc:
-                raise RepositoryDownloadError(
-                    f"GitHub returned HTTP {exc.response.status_code}"
-                ) from exc
-
-            except (httpx.RequestError, ValueError, KeyError) as exc:
-                raise RepositoryDownloadError(
-                    "Unable to download repository from GitHub"
-                ) from exc
+        archive_path = Path(archive_name)
 
         try:
-            await asyncio.to_thread(
-                self._extract_archive,
-                bytes(archive_data),
-                destination
-            )
-        except RepositoryDownloadError:
-            raise
-        except Exception as exc:
-            raise RepositoryDownloadError(
-                "Unable to safely extract repository archive"
-            ) from exc
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=timeout,
+            ) as client:
+                try:
+                    commit_response = await client.get(
+                        f"{self.GITHUB_API}/repos/{full_name}/commits/{branch}",
+                        headers=headers,
+                    )
+                    commit_response.raise_for_status()
 
-        return commit_sha
+                    commit_data = commit_response.json()
+                    commit_sha = commit_data.get("sha")
 
-    def _extract_archive(self, archive: bytes, destination: Path):
+                    if not isinstance(commit_sha, str) or not commit_sha:
+                        raise RepositoryDownloadError(
+                            "GitHub returned an invalid commit reference."
+                        )
+
+                    archive_url = (
+                        f"{self.GITHUB_API}/repos/{full_name}/tarball/{commit_sha}"
+                    )
+
+                    downloaded_size = 0
+
+                    async with client.stream(
+                        "GET",
+                        archive_url,
+                        headers=headers,
+                    ) as response:
+                        response.raise_for_status()
+
+                        content_length = response.headers.get("content-length")
+
+                        if content_length:
+                            try:
+                                if int(content_length) > settings.REPOSITORY_MAX_ARCHIVE_SIZE:
+                                    raise RepositoryDownloadError(
+                                        "Repository archive exceeds the download size limit."
+                                    )
+                            except ValueError:
+                                pass
+
+                        with archive_path.open("wb") as archive_file:
+                            async for chunk in response.aiter_bytes():
+                                downloaded_size += len(chunk)
+
+                                if downloaded_size > settings.REPOSITORY_MAX_ARCHIVE_SIZE:
+                                    raise RepositoryDownloadError(
+                                        "Repository archive exceeds the download size limit."
+                                    )
+
+                                archive_file.write(chunk)
+
+                except RepositoryDownloadError:
+                    raise
+
+                except httpx.HTTPStatusError as exc:
+                    raise RepositoryDownloadError(
+                        f"GitHub returned HTTP {exc.response.status_code}"
+                    ) from exc
+
+                except (httpx.RequestError, ValueError, KeyError) as exc:
+                    raise RepositoryDownloadError(
+                        "Unable to download repository from GitHub."
+                    ) from exc
+
+            if downloaded_size == 0:
+                raise RepositoryDownloadError(
+                    "GitHub returned an empty repository archive."
+                )
+
+            try:
+                await asyncio.to_thread(
+                    self._extract_archive,
+                    archive_path,
+                    destination,
+                )
+            except RepositoryDownloadError:
+                raise
+            except Exception as exc:
+                raise RepositoryDownloadError(
+                    "Unable to safely extract repository archive."
+                ) from exc
+
+            return commit_sha
+
+        finally:
+            archive_path.unlink(missing_ok=True)
+
+    def _extract_archive(
+        self,
+        archive_path: Path,
+        destination: Path,
+    ):
         destination.mkdir(parents=True, exist_ok=True)
+        destination = destination.resolve()
 
         files_count = 0
         total_size = 0
 
-        with tarfile.open(
-            fileobj=io.BytesIO(archive),
-            mode="r:gz"
-        ) as tar:
-            for member in tar:
-                if not member.isfile():
-                    continue
+        try:
+            with tarfile.open(archive_path, mode="r:gz") as tar:
+                for member in tar:
+                    if not member.isfile():
+                        continue
 
-                relative = PurePosixPath(member.name)
+                    raw_name = member.name
 
-                if relative.is_absolute() or ".." in relative.parts:
-                    continue
+                    if not raw_name or "\\" in raw_name or "\x00" in raw_name:
+                        continue
 
-                parts = relative.parts
+                    relative = PurePosixPath(raw_name)
 
-                if len(parts) < 2:
-                    continue
+                    if relative.is_absolute() or ".." in relative.parts:
+                        continue
 
-                parts = parts[1:]
+                    parts = relative.parts
 
-                if any(part in self.IGNORED_DIRS for part in parts[:-1]):
-                    continue
+                    # GitHub archives contain a single top-level directory.
+                    if len(parts) < 2:
+                        continue
 
-                filename = parts[-1]
+                    parts = parts[1:]
 
-                if (
-                    filename not in self.ALLOWED_NAMES
-                    and Path(filename).suffix.lower()
-                    not in self.ALLOWED_SUFFIXES
-                ):
-                    continue
+                    if not parts or any(
+                        part in self.IGNORED_DIRS for part in parts[:-1]
+                    ):
+                        continue
 
-                if member.size <= 0:
-                    continue
+                    filename = parts[-1]
 
-                if member.size > settings.REPOSITORY_MAX_FILE_SIZE:
-                    continue
+                    if (
+                        filename not in self.ALLOWED_NAMES
+                        and Path(filename).suffix.lower()
+                        not in self.ALLOWED_SUFFIXES
+                    ):
+                        continue
 
-                if files_count >= settings.REPOSITORY_MAX_FILES:
-                    break
+                    if member.size <= 0:
+                        continue
 
-                if total_size + member.size > settings.REPOSITORY_MAX_TOTAL_SIZE:
-                    break
+                    if member.size > settings.REPOSITORY_MAX_FILE_SIZE:
+                        continue
 
-                target = destination.joinpath(*parts)
+                    if files_count >= settings.REPOSITORY_MAX_FILES:
+                        break
 
-                try:
-                    target.resolve().relative_to(destination.resolve())
-                except ValueError:
-                    continue
+                    if (
+                        total_size + member.size
+                        > settings.REPOSITORY_MAX_TOTAL_SIZE
+                    ):
+                        break
 
-                target.parent.mkdir(parents=True, exist_ok=True)
+                    target = destination.joinpath(*parts)
 
-                source = tar.extractfile(member)
+                    try:
+                        target.resolve().relative_to(destination)
+                    except (OSError, ValueError):
+                        continue
 
-                if source is None:
-                    continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
 
-                content = source.read(
-                    settings.REPOSITORY_MAX_FILE_SIZE + 1
-                )
+                    source = tar.extractfile(member)
 
-                if len(content) != member.size:
-                    continue
+                    if source is None:
+                        continue
 
-                if b"\x00" in content:
-                    continue
+                    with source:
+                        content = source.read(
+                            settings.REPOSITORY_MAX_FILE_SIZE + 1
+                        )
 
-                target.write_bytes(content)
+                    if len(content) != member.size:
+                        continue
 
-                files_count += 1
-                total_size += len(content)
+                    if b"\x00" in content:
+                        continue
+
+                    target.write_bytes(content)
+
+                    files_count += 1
+                    total_size += len(content)
+
+        except (tarfile.TarError, OSError) as exc:
+            raise RepositoryDownloadError(
+                "Repository archive is invalid or could not be extracted."
+            ) from exc
 
         if files_count == 0:
             raise RepositoryDownloadError(
-                "No supported source files were found in this repository"
+                "No supported source files were found in this repository."
             )
 
 

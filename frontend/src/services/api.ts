@@ -1,9 +1,26 @@
 import axios from 'axios'
 
+export const API_ROOT = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '')
+
 export const api = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:8000',
-  timeout: 15000,
+  baseURL: `${API_ROOT}/api/v1`,
+  timeout: 20000,
   headers: { 'Content-Type': 'application/json' },
+})
+
+export const healthApi = axios.create({
+  baseURL: API_ROOT,
+  timeout: 10000,
+})
+
+api.interceptors.request.use((config) => {
+  const token = sessionStorage.getItem('replock_access_token')
+
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+
+  return config
 })
 
 export function getApiErrorMessage(error: unknown): string {
@@ -15,5 +32,6 @@ export function getApiErrorMessage(error: unknown): string {
     if (!error.response) return 'Cannot reach the RepLock API. Check that the backend is running.'
     return `The API returned ${error.response.status}. This operation is not available yet.`
   }
+
   return error instanceof Error ? error.message : 'An unexpected error occurred.'
 }

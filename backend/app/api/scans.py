@@ -17,9 +17,8 @@ from app.schemas.scan import ScanCreate, ScanResponse
 from app.schemas.finding import FindingResponse
 from app.services.scan_orchestrator import (
     scan_orchestrator,
-    ScanOrchestrationError
+    ScanOrchestrationError,
 )
-
 
 router = APIRouter(prefix="/scans", tags=["Scans"])
 
@@ -36,6 +35,50 @@ class ScanRunResponse(BaseModel):
     limitations: list[str] = Field(default_factory=list)
 
     model_config = ConfigDict(from_attributes=True)
+
+
+def _get_owned_repository(
+    repository_id: uuid.UUID,
+    db: Session,
+    current_user: User,
+):
+    repository = db.scalar(
+        select(Repository).where(
+            Repository.id == repository_id,
+            Repository.owner_id == current_user.id,
+        )
+    )
+
+    if not repository:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repository not found",
+        )
+
+    return repository
+
+
+def _get_owned_scan(
+    scan_id: uuid.UUID,
+    db: Session,
+    current_user: User,
+):
+    scan = db.scalar(
+        select(Scan)
+        .join(Repository, Scan.repository_id == Repository.id)
+        .where(
+            Scan.id == scan_id,
+            Repository.owner_id == current_user.id,
+        )
+    )
+
+    if not scan:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Scan not found",
+        )
+
+    return scan
 
 
 def mark_scan_failed(db: Session, scan_id: uuid.UUID):
@@ -55,36 +98,29 @@ def mark_scan_failed(db: Session, scan_id: uuid.UUID):
 @router.post(
     "/run",
     response_model=ScanRunResponse,
-    status_code=status.HTTP_201_CREATED
+    status_code=status.HTTP_201_CREATED,
 )
 async def run_repository_scan(
     scan_data: ScanCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     if scan_data.scan_type == "dynamic":
         raise HTTPException(
-            status_code=400,
-            detail="Dynamic scanning is not available yet"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Dynamic scanning is not available yet",
         )
 
-    repository = db.scalar(
-        select(Repository).where(
-            Repository.id == scan_data.repository_id,
-            Repository.owner_id == current_user.id
-        )
+    repository = _get_owned_repository(
+        scan_data.repository_id,
+        db,
+        current_user,
     )
-
-    if not repository:
-        raise HTTPException(
-            status_code=404,
-            detail="Repository not found"
-        )
 
     if not current_user.github_access_token_encrypted:
         raise HTTPException(
-            status_code=401,
-            detail="GitHub account is not connected"
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="GitHub account is not connected",
         )
 
     try:
@@ -93,8 +129,8 @@ async def run_repository_scan(
         )
     except Exception as exc:
         raise HTTPException(
-            status_code=500,
-            detail="Unable to access GitHub credentials"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to access GitHub credentials",
         ) from exc
 
     new_scan = Scan(
@@ -102,7 +138,7 @@ async def run_repository_scan(
         commit_sha=scan_data.commit_sha,
         scan_type=scan_data.scan_type,
         status="running",
-        started_at=datetime.now(timezone.utc)
+        started_at=datetime.now(timezone.utc),
     )
 
     db.add(new_scan)
@@ -110,17 +146,17 @@ async def run_repository_scan(
     try:
         db.commit()
         db.refresh(new_scan)
-    except IntegrityError as exc:
+    except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(
-            status_code=400,
-            detail="Unable to create scan"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to create scan",
         ) from exc
 
     try:
         result = await scan_orchestrator.run(
             repository,
-            access_token
+            access_token,
         )
 
         new_scan.commit_sha = result["commit_sha"]
@@ -140,11 +176,12 @@ async def run_repository_scan(
                     )[:100],
                     file_path=(
                         item.file_path[:500]
-                        if item.file_path else None
+                        if item.file_path
+                        else None
                     ),
                     line_number=item.line_start,
                     evidence=item.evidence,
-                    remediation=item.remediation
+                    remediation=item.remediation,
                 )
             )
 
@@ -154,7 +191,10 @@ async def run_repository_scan(
         findings = db.scalars(
             select(Finding)
             .where(Finding.scan_id == new_scan.id)
-            .order_by(Finding.created_at.asc(), Finding.id.asc())
+            .order_by(
+                Finding.created_at.asc(),
+                Finding.id.asc(),
+            )
         ).all()
 
         return ScanRunResponse(
@@ -162,7 +202,7 @@ async def run_repository_scan(
             findings=findings,
             semgrep_findings=result["semgrep_findings"],
             files_analyzed=result["files_analyzed"],
-            limitations=result["limitations"]
+            limitations=result["limitations"],
         )
 
     except Exception as exc:
@@ -171,56 +211,54 @@ async def run_repository_scan(
 
         if isinstance(exc, ScanOrchestrationError):
             raise HTTPException(
-                status_code=502,
-                detail=str(exc)
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=str(exc),
             ) from exc
 
         raise HTTPException(
-            status_code=502,
-            detail="Repository security scan failed"
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Repository security scan failed",
         ) from exc
 
 
 @router.post(
     "/",
     response_model=ScanResponse,
-    status_code=status.HTTP_201_CREATED
+    status_code=status.HTTP_201_CREATED,
 )
 def create_scan(
     scan_data: ScanCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     if scan_data.scan_type == "dynamic":
         raise HTTPException(
-            status_code=400,
-            detail="Dynamic scanning is not available yet"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Dynamic scanning is not available yet",
         )
 
-    repository = db.scalar(
-        select(Repository).where(
-            Repository.id == scan_data.repository_id,
-            Repository.owner_id == current_user.id
-        )
+    repository = _get_owned_repository(
+        scan_data.repository_id,
+        db,
+        current_user,
     )
 
-    if not repository:
-        raise HTTPException(
-            status_code=404,
-            detail="Repository not found"
-        )
+    new_scan = Scan(
+        repository_id=repository.id,
+        commit_sha=scan_data.commit_sha,
+        scan_type=scan_data.scan_type,
+    )
 
-    new_scan = Scan(**scan_data.model_dump())
     db.add(new_scan)
 
     try:
         db.commit()
         db.refresh(new_scan)
-    except IntegrityError as exc:
+    except SQLAlchemyError as exc:
         db.rollback()
         raise HTTPException(
-            status_code=400,
-            detail="Unable to create scan"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to create scan",
         ) from exc
 
     return new_scan
@@ -229,11 +267,11 @@ def create_scan(
 @router.get("/", response_model=list[ScanResponse])
 def get_scans(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
     return db.scalars(
         select(Scan)
-        .join(Repository)
+        .join(Repository, Scan.repository_id == Repository.id)
         .where(Repository.owner_id == current_user.id)
         .order_by(Scan.created_at.desc())
     ).all()
@@ -243,58 +281,57 @@ def get_scans(
 def get_scan(
     scan_id: uuid.UUID,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    scan = db.scalar(
-        select(Scan)
-        .join(Repository)
-        .where(
-            Scan.id == scan_id,
-            Repository.owner_id == current_user.id
-        )
-    )
-
-    if not scan:
-        raise HTTPException(
-            status_code=404,
-            detail="Scan not found"
-        )
-
-    return scan
+    return _get_owned_scan(scan_id, db, current_user)
 
 
-@router.patch("/{scan_id}/status", response_model=ScanResponse)
+@router.patch(
+    "/{scan_id}/status",
+    response_model=ScanResponse,
+)
 def update_scan_status(
     scan_id: uuid.UUID,
     update_data: ScanStatusUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
 ):
-    scan = db.scalar(
-        select(Scan)
-        .join(Repository)
-        .where(
-            Scan.id == scan_id,
-            Repository.owner_id == current_user.id
-        )
-    )
-
-    if not scan:
-        raise HTTPException(
-            status_code=404,
-            detail="Scan not found"
-        )
-
+    scan = _get_owned_scan(scan_id, db, current_user)
     new_status = update_data.status
+
+    allowed_transitions = {
+        "pending": {"running", "failed"},
+        "running": {"completed", "failed"},
+        "completed": set(),
+        "failed": set(),
+    }
+
+    if new_status == scan.status:
+        return scan
+
+    if new_status not in allowed_transitions[scan.status]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot change scan status from '{scan.status}' to '{new_status}'",
+        )
+
+    now = datetime.now(timezone.utc)
     scan.status = new_status
 
-    if new_status == "running" and scan.started_at is None:
-        scan.started_at = datetime.now(timezone.utc)
+    if new_status == "running":
+        scan.started_at = now
 
     if new_status in {"completed", "failed"}:
-        scan.completed_at = datetime.now(timezone.utc)
+        scan.completed_at = now
 
-    db.commit()
-    db.refresh(scan)
+    try:
+        db.commit()
+        db.refresh(scan)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to update scan status",
+        ) from exc
 
     return scan

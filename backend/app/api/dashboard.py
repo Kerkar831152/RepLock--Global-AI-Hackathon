@@ -14,6 +14,7 @@ router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 SEVERITIES = ("critical", "high", "medium", "low", "info")
 STATUSES = ("open", "in_progress", "resolved", "false_positive")
 SCAN_STATUSES = ("pending", "running", "completed", "failed")
+UNRESOLVED_STATUSES = ("open", "in_progress")
 
 SEVERITY_WEIGHTS = {
     "critical": 20,
@@ -44,20 +45,17 @@ def get_dashboard_overview(
 ):
     owner_filter = Repository.owner_id == current_user.id
 
-    # Repository count
     total_repositories = db.scalar(
         select(func.count(Repository.id))
         .where(owner_filter)
     ) or 0
 
-    # Scan count
     total_scans = db.scalar(
         select(func.count(Scan.id))
         .join(Repository, Scan.repository_id == Repository.id)
         .where(owner_filter)
     ) or 0
 
-    # Scan status counts
     scan_rows = db.execute(
         select(Scan.status, func.count(Scan.id))
         .join(Repository, Scan.repository_id == Repository.id)
@@ -71,7 +69,6 @@ def get_dashboard_overview(
         if scan_status in scan_status_counts:
             scan_status_counts[scan_status] = count
 
-    # Finding severity and status counts
     finding_rows = db.execute(
         select(
             Finding.severity,
@@ -86,6 +83,7 @@ def get_dashboard_overview(
 
     findings_by_severity = {key: 0 for key in SEVERITIES}
     findings_by_status = {key: 0 for key in STATUSES}
+    unresolved_by_severity = {key: 0 for key in SEVERITIES}
 
     for severity, finding_status, count in finding_rows:
         if severity in findings_by_severity:
@@ -94,18 +92,22 @@ def get_dashboard_overview(
         if finding_status in findings_by_status:
             findings_by_status[finding_status] += count
 
+        if (
+            severity in unresolved_by_severity
+            and finding_status in UNRESOLVED_STATUSES
+        ):
+            unresolved_by_severity[severity] += count
+
     total_findings = sum(findings_by_severity.values())
 
-    # Security score based on unresolved findings.
     risk_points = sum(
-        findings_by_severity[severity] * weight
+        unresolved_by_severity[severity] * weight
         for severity, weight in SEVERITY_WEIGHTS.items()
     )
 
     security_score = max(0, 100 - min(100, risk_points))
     risk_level = get_risk_level(risk_points)
 
-    # Recent scans, including the number of findings per scan.
     recent_scan_rows = db.execute(
         select(
             Scan.id,
@@ -150,7 +152,6 @@ def get_dashboard_overview(
         for row in recent_scan_rows
     ]
 
-    # Most affected source files
     affected_file_rows = db.execute(
         select(
             Finding.file_path,

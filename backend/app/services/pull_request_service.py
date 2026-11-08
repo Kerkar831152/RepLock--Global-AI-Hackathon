@@ -1,3 +1,4 @@
+
 import re
 from urllib.parse import quote
 
@@ -18,7 +19,6 @@ class PullRequestError(Exception):
 
 
 class PullRequestService:
-
     GITHUB_API = "https://api.github.com"
 
     MAX_FILES = 3
@@ -72,14 +72,24 @@ class PullRequestService:
                 )
 
             response.raise_for_status()
-            return response.json()
+
+            data = response.json()
+
+            if not isinstance(data, (dict, list)):
+                raise PullRequestError("GitHub returned an invalid response.")
+
+            return data
 
         except PullRequestError:
             raise
-        except httpx.TimeoutException as exc:
-            raise PullRequestError("GitHub API request timed out") from exc
-        except httpx.HTTPError as exc:
-            raise PullRequestError("Unable to communicate with GitHub") from exc
+        except (httpx.TimeoutException, httpx.TimeoutException) as exc:
+            raise PullRequestError(
+                "GitHub API request timed out."
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise PullRequestError(
+                "Unable to communicate with GitHub."
+            ) from exc
 
     async def list_pull_requests(
         self,
@@ -105,24 +115,39 @@ class PullRequestService:
                 }
             )
 
-        return [
-            {
+        if not isinstance(result, list):
+            raise PullRequestError("GitHub returned an invalid pull request list.")
+
+        pull_requests = []
+
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+
+            head = item.get("head") or {}
+            base = item.get("base") or {}
+            user = item.get("user") or {}
+
+            if not isinstance(head, dict) or not isinstance(base, dict):
+                continue
+
+            if not item.get("number") or not head.get("sha"):
+                continue
+
+            pull_requests.append({
                 "number": item["number"],
-                "title": item["title"],
-                "state": item["state"],
-                "html_url": item["html_url"],
-                "author": (
-                    item.get("user", {}).get("login")
-                    if item.get("user") else None
-                ),
-                "head_sha": item["head"]["sha"],
-                "base_branch": item["base"]["ref"],
+                "title": item.get("title", ""),
+                "state": item.get("state", "open"),
+                "html_url": item.get("html_url", ""),
+                "author": user.get("login") if isinstance(user, dict) else None,
+                "head_sha": head["sha"],
+                "base_branch": base.get("ref", ""),
                 "changed_files": item.get("changed_files", 0),
                 "additions": item.get("additions", 0),
                 "deletions": item.get("deletions", 0)
-            }
-            for item in result
-        ]
+            })
+
+        return pull_requests
 
     async def get_pull_request_metadata(
         self,
@@ -137,21 +162,25 @@ class PullRequestService:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(20, connect=5)
         ) as client:
-            pull_request = await self._get(
-                client,
-                url,
-                token
-            )
+            pull_request = await self._get(client, url, token)
+
+        if not isinstance(pull_request, dict):
+            raise PullRequestError("GitHub returned invalid pull request metadata.")
 
         if pull_request.get("state") != "open":
             raise PullRequestError(
                 "Only open pull requests can be reviewed."
             )
 
+        head = pull_request.get("head") or {}
+
+        if not isinstance(head, dict) or not head.get("sha"):
+            raise PullRequestError("Pull request head commit is unavailable.")
+
         return {
             "number": number,
             "state": pull_request["state"],
-            "head_sha": pull_request["head"]["sha"],
+            "head_sha": head["sha"],
             "html_url": pull_request["html_url"],
             "changed_files": pull_request.get("changed_files", 0)
         }
@@ -186,9 +215,7 @@ class PullRequestService:
                 if diff_line.startswith("\\"):
                     continue
 
-                if diff_line.startswith(" "):
-                    source_line = diff_line[1:]
-                elif diff_line.startswith("+"):
+                if diff_line.startswith((" ", "+")):
                     source_line = diff_line[1:]
                 elif diff_line.startswith("-"):
                     continue
@@ -219,8 +246,7 @@ class PullRequestService:
         path = item.get("filename", "").lower()
 
         priority = sum(
-            1 for name in self.PRIORITY_NAMES
-            if name in path
+            1 for name in self.PRIORITY_NAMES if name in path
         )
 
         changes = item.get("additions", 0) + item.get("deletions", 0)
@@ -254,10 +280,15 @@ class PullRequestService:
                 }
             )
 
+            if not isinstance(result, list):
+                raise PullRequestError("GitHub returned an invalid changed-files list.")
+
             if not result:
                 break
 
-            all_files.extend(result)
+            all_files.extend(
+                item for item in result if isinstance(item, dict)
+            )
 
             if len(result) < page_size:
                 break
@@ -294,8 +325,10 @@ class PullRequestService:
         candidates = [
             item for item in files
             if item.get("status") != "removed"
+            and isinstance(item.get("additions", 0), int)
+            and isinstance(item.get("deletions", 0), int)
             and item.get("additions", 0) + item.get("deletions", 0) > 0
-            and item.get("patch")
+            and isinstance(item.get("patch"), str)
             and item.get("filename")
         ]
 
@@ -344,7 +377,11 @@ class PullRequestService:
         try:
             analysis = await security_analysis_service.analyze(
                 SecurityAnalysisRequest(
-                    files=selected_files
+                    files=selected_files,
+                    research_query=(
+                        "Research security vulnerabilities and secure coding "
+                        "practices relevant to these pull request code changes."
+                    )
                 )
             )
         except SecurityAnalysisError as exc:
