@@ -43,6 +43,7 @@ class CodeFileInput(BaseModel):
     path: str = Field(min_length=1, max_length=300)
     content: str = Field(min_length=1, max_length=4000)
     start_line: int = Field(default=1, ge=1)
+    original_line_count: int | None = Field(default=None, ge=1)
 
     @field_validator("path")
     @classmethod

@@ -1,4 +1,5 @@
 
+from dataclasses import dataclass
 import re
 from urllib.parse import quote
 
@@ -6,7 +7,8 @@ import httpx
 
 from app.schemas.security_analysis import (
     CodeFileInput,
-    SecurityAnalysisRequest
+    SecurityAnalysisRequest,
+    SecurityAnalysisResponse,
 )
 from app.services.security_analysis_service import (
     security_analysis_service,
@@ -16,6 +18,13 @@ from app.services.security_analysis_service import (
 
 class PullRequestError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class ChangedCode:
+    source: CodeFileInput
+    changed_lines: frozenset[int]
+    added_source: str
 
 
 class PullRequestService:
@@ -61,9 +70,22 @@ class PullRequestService:
                     "GitHub authorization expired. Reconnect GitHub."
                 )
 
-            if response.status_code == 403:
+            if response.status_code in {403, 429}:
+                if (
+                    response.status_code == 429
+                    or response.headers.get("x-ratelimit-remaining") == "0"
+                ):
+                    reset = response.headers.get("x-ratelimit-reset")
+                    retry_after = (
+                        f" Try again after {reset}."
+                        if reset and reset.isdigit()
+                        else " Retry after the GitHub rate limit resets."
+                    )
+                    raise PullRequestError(
+                        "GitHub API rate limit was reached." + retry_after
+                    )
                 raise PullRequestError(
-                    "GitHub denied access or the API rate limit was reached."
+                    "GitHub denied access to the pull request or repository."
                 )
 
             if response.status_code == 404:
@@ -82,7 +104,7 @@ class PullRequestService:
 
         except PullRequestError:
             raise
-        except (httpx.TimeoutException, httpx.TimeoutException) as exc:
+        except httpx.TimeoutException as exc:
             raise PullRequestError(
                 "GitHub API request timed out."
             ) from exc
@@ -164,32 +186,55 @@ class PullRequestService:
         ) as client:
             pull_request = await self._get(client, url, token)
 
+        return self._normalize_metadata(pull_request, number)
+
+    @staticmethod
+    def _normalize_metadata(pull_request: object, number: int) -> dict:
         if not isinstance(pull_request, dict):
             raise PullRequestError("GitHub returned invalid pull request metadata.")
 
         if pull_request.get("state") != "open":
-            raise PullRequestError(
-                "Only open pull requests can be reviewed."
-            )
+            raise PullRequestError("Only open pull requests can be reviewed.")
 
         head = pull_request.get("head") or {}
+        base = pull_request.get("base") or {}
+        changed_files = pull_request.get("changed_files")
 
-        if not isinstance(head, dict) or not head.get("sha"):
-            raise PullRequestError("Pull request head commit is unavailable.")
+        if (
+            not isinstance(head, dict)
+            or not isinstance(head.get("sha"), str)
+            or not head["sha"]
+            or not isinstance(base, dict)
+            or not isinstance(base.get("sha"), str)
+            or not base["sha"]
+        ):
+            raise PullRequestError("Pull request commit references are unavailable.")
+
+        if (
+            not isinstance(changed_files, int)
+            or isinstance(changed_files, bool)
+            or changed_files < 0
+        ):
+            raise PullRequestError("GitHub returned an invalid changed-file count.")
+
+        html_url = pull_request.get("html_url")
+        if not isinstance(html_url, str) or not html_url:
+            raise PullRequestError("GitHub returned an invalid pull request URL.")
 
         return {
             "number": number,
-            "state": pull_request["state"],
+            "state": "open",
             "head_sha": head["sha"],
-            "html_url": pull_request["html_url"],
-            "changed_files": pull_request.get("changed_files", 0)
+            "base_sha": base["sha"],
+            "html_url": html_url,
+            "changed_files": changed_files,
         }
 
     def _extract_hunk(
         self,
         patch: str,
         path: str
-    ) -> CodeFileInput | None:
+    ) -> ChangedCode | None:
 
         lines = patch.splitlines()
 
@@ -202,10 +247,10 @@ class PullRequestService:
             if not match:
                 continue
 
-            start_line = int(match.group(1))
-            expected_lines = int(match.group(2) or 1)
-
-            source_lines = []
+            current_line = int(match.group(1))
+            source_lines: list[str] = []
+            changed_lines: set[int] = set()
+            added_lines: list[str] = []
             total_chars = 0
 
             for diff_line in lines[index + 1:]:
@@ -215,10 +260,14 @@ class PullRequestService:
                 if diff_line.startswith("\\"):
                     continue
 
-                if diff_line.startswith((" ", "+")):
-                    source_line = diff_line[1:]
-                elif diff_line.startswith("-"):
+                if diff_line.startswith("-"):
                     continue
+                if diff_line.startswith("+"):
+                    source_line = diff_line[1:]
+                    is_added = True
+                elif diff_line.startswith(" "):
+                    source_line = diff_line[1:]
+                    is_added = False
                 else:
                     break
 
@@ -226,30 +275,50 @@ class PullRequestService:
                     break
 
                 source_lines.append(source_line)
+                if is_added:
+                    changed_lines.add(current_line)
+                    added_lines.append(source_line)
                 total_chars += len(source_line) + 1
+                current_line += 1
 
-                if len(source_lines) >= expected_lines:
-                    break
+            if not source_lines or not changed_lines:
+                continue
 
-            if not source_lines:
-                return None
+            try:
+                source = CodeFileInput(
+                    path=path,
+                    content="\n".join(source_lines),
+                    start_line=int(match.group(1)),
+                )
+            except ValueError:
+                continue
 
-            return CodeFileInput(
-                path=path,
-                content="\n".join(source_lines),
-                start_line=start_line
+            return ChangedCode(
+                source=source,
+                changed_lines=frozenset(changed_lines),
+                added_source="\n".join(added_lines),
             )
 
         return None
 
     def _file_priority(self, item: dict) -> tuple:
-        path = item.get("filename", "").lower()
+        filename = item.get("filename")
+        path = filename.lower() if isinstance(filename, str) else ""
 
         priority = sum(
             1 for name in self.PRIORITY_NAMES if name in path
         )
 
-        changes = item.get("additions", 0) + item.get("deletions", 0)
+        additions = item.get("additions", 0)
+        deletions = item.get("deletions", 0)
+        changes = (
+            additions + deletions
+            if isinstance(additions, int)
+            and not isinstance(additions, bool)
+            and isinstance(deletions, int)
+            and not isinstance(deletions, bool)
+            else 0
+        )
 
         return (-priority, -changes, path)
 
@@ -287,7 +356,8 @@ class PullRequestService:
                 break
 
             all_files.extend(
-                item for item in result if isinstance(item, dict)
+                item for item in result[:page_size]
+                if isinstance(item, dict)
             )
 
             if len(result) < page_size:
@@ -312,6 +382,7 @@ class PullRequestService:
 
         repository = quote(full_name, safe="/")
         base_url = f"{self.GITHUB_API}/repos/{repository}/pulls/{number}"
+        metadata_url = base_url
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(30, connect=5)
@@ -322,19 +393,36 @@ class PullRequestService:
                 token
             )
 
+            latest_metadata = self._normalize_metadata(
+                await self._get(client, metadata_url, token),
+                number,
+            )
+
+        if (
+            latest_metadata["head_sha"] != metadata["head_sha"]
+            or latest_metadata["base_sha"] != metadata["base_sha"]
+        ):
+            raise PullRequestError(
+                "The pull request changed during review. Retry to review its latest commit."
+            )
+        metadata = latest_metadata
+
         candidates = [
             item for item in files
             if item.get("status") != "removed"
+            and isinstance(item.get("filename"), str)
+            and item.get("filename")
             and isinstance(item.get("additions", 0), int)
+            and not isinstance(item.get("additions", 0), bool)
             and isinstance(item.get("deletions", 0), int)
+            and not isinstance(item.get("deletions", 0), bool)
             and item.get("additions", 0) + item.get("deletions", 0) > 0
             and isinstance(item.get("patch"), str)
-            and item.get("filename")
         ]
 
         candidates.sort(key=self._file_priority)
 
-        selected_files = []
+        selected_files: list[ChangedCode] = []
         total_chars = 0
 
         for item in candidates:
@@ -342,14 +430,14 @@ class PullRequestService:
                 break
 
             try:
-                code_file = self._extract_hunk(
+                changed_code = self._extract_hunk(
                     item["patch"],
                     item["filename"]
                 )
             except ValueError:
                 continue
 
-            if code_file is None:
+            if changed_code is None:
                 continue
 
             remaining = self.MAX_TOTAL_CHARS - total_chars
@@ -357,44 +445,113 @@ class PullRequestService:
             if remaining <= 0:
                 break
 
-            if len(code_file.content) > remaining:
-                trimmed = code_file.content[:remaining]
+            if len(changed_code.source.content) > remaining:
+                trimmed = changed_code.source.content[:remaining]
                 trimmed = trimmed.rsplit("\n", 1)[0]
 
                 if not trimmed:
                     break
 
-                code_file.content = trimmed
+                kept_line_count = len(trimmed.splitlines())
+                last_line = (
+                    changed_code.source.start_line + kept_line_count - 1
+                )
+                changed_code = ChangedCode(
+                    source=changed_code.source.model_copy(
+                        update={"content": trimmed}
+                    ),
+                    changed_lines=frozenset(
+                        line for line in changed_code.changed_lines
+                        if line <= last_line
+                    ),
+                    added_source=changed_code.added_source,
+                )
+                if not changed_code.changed_lines:
+                    continue
 
-            selected_files.append(code_file)
-            total_chars += len(code_file.content)
+            selected_files.append(changed_code)
+            total_chars += len(changed_code.source.content)
 
-        if not selected_files:
-            raise PullRequestError(
-                "No supported code diff hunks were available for analysis."
+        limitations = []
+        if metadata["changed_files"] != len(files):
+            limitations.append(
+                f"GitHub reports {metadata['changed_files']} changed files, "
+                f"but returned {len(files)} file records."
             )
 
-        try:
-            analysis = await security_analysis_service.analyze(
-                SecurityAnalysisRequest(
-                    files=selected_files,
-                    research_query=(
-                        "Research security vulnerabilities and secure coding "
-                        "practices relevant to these pull request code changes."
+        if not files:
+            summary = (
+                "This pull request contains no changed files."
+                if metadata["changed_files"] == 0
+                else "GitHub returned no changed-file records for this pull request."
+            )
+            findings = []
+        elif not selected_files:
+            summary = (
+                "No analyzable added source-code lines were found in this "
+                "pull request."
+            )
+            findings = []
+            limitations.append(
+                "Changed files were deleted, binary, unsupported, or did not "
+                "include a usable text patch."
+            )
+        else:
+            try:
+                analysis = await security_analysis_service.analyze(
+                    SecurityAnalysisRequest(
+                        files=[item.source for item in selected_files],
+                        research_query=(
+                            "Assess only vulnerabilities introduced by the "
+                            "added lines in these pull request diffs. "
+                            "Treat unchanged context as context, not as a "
+                            "newly introduced finding."
+                        )
                     )
                 )
+            except SecurityAnalysisError as exc:
+                raise PullRequestError(
+                    "AI security analysis failed for this pull request."
+                ) from exc
+
+            had_findings = bool(analysis.findings)
+            files_by_path = {
+                item.source.path: item for item in selected_files
+            }
+            verified_findings = []
+            for finding in analysis.findings:
+                changed_file = files_by_path.get(finding.file_path)
+                if not changed_file:
+                    continue
+                if not any(
+                    finding.line_start <= line <= finding.line_end
+                    for line in changed_file.changed_lines
+                ):
+                    continue
+
+                evidence = " ".join(finding.evidence.split())
+                added_source = " ".join(changed_file.added_source.split())
+                if evidence and evidence in added_source:
+                    verified_findings.append(finding)
+                else:
+                    limitations.append(
+                        "A finding was excluded because its evidence did not "
+                        "quote an added line in the pull request."
+                    )
+
+            analysis.findings = verified_findings
+            if had_findings and not verified_findings:
+                analysis.summary = (
+                    "No vulnerabilities associated with added lines were "
+                    "verified."
+                )
+
+            limitations.extend(analysis.limitations)
+
+            limitations.append(
+                "The review analyses at most three selected files and the "
+                "first changed hunk from each selected file."
             )
-        except SecurityAnalysisError as exc:
-            raise PullRequestError(
-                "AI security analysis failed for this pull request."
-            ) from exc
-
-        limitations = list(analysis.limitations)
-
-        limitations.append(
-            "The review analyses at most three selected files and the first "
-            "diff hunk from each selected file."
-        )
 
         if metadata["changed_files"] > self.MAX_DIFF_FILES:
             limitations.append(
@@ -413,10 +570,18 @@ class PullRequestService:
                 "GitHub did not return all files reported in the pull request."
             )
 
+        if not files or not selected_files:
+            analysis = SecurityAnalysisResponse(
+                summary=summary,
+                findings=findings,
+                limitations=limitations,
+            )
+
         return {
             "head_sha": metadata["head_sha"],
             "html_url": metadata["html_url"],
             "analysis": analysis,
+            "changed_files": metadata["changed_files"],
             "files_analyzed": len(selected_files),
             "limitations": list(dict.fromkeys(limitations))
         }

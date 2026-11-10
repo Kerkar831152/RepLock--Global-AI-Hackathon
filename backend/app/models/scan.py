@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import String, DateTime, ForeignKey, Text, Index, Integer
+from sqlalchemy import String, DateTime, ForeignKey, Text, Index, Integer, JSON
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,7 +26,11 @@ class Scan(Base):
     )
     commit_sha: Mapped[str | None] = mapped_column(String(100), nullable=True)
     pull_request_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    changed_files: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    review_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     files_analyzed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    semgrep_findings: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    limitations: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False)
     scan_type: Mapped[str] = mapped_column(String(50), default="full", nullable=False)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)

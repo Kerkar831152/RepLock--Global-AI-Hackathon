@@ -21,6 +21,7 @@ export interface PullRequestReview {
   head_sha: string
   status: string
   summary: string
+  changed_files: number
   files_analyzed: number
   findings: ScanFinding[]
   limitations: string[]

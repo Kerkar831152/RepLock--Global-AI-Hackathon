@@ -28,6 +28,7 @@ class PullRequestReviewResponse(BaseModel):
     head_sha: str
     status: str
     summary: str
+    changed_files: int
     files_analyzed: int
     findings: list[FindingResponse]
     limitations: list[str] = Field(default_factory=list)

@@ -1,18 +1,29 @@
 
-from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from datetime import datetime, timedelta, timezone
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import case, distinct, func, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models import User, Repository, Scan, Finding
-from app.schemas.dashboard import DashboardOverviewResponse
+from app.schemas.dashboard import (
+    DashboardOverviewResponse,
+    SecurityTrendResponse,
+)
 
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
-STATUSES = ("open", "in_progress", "resolved", "false_positive")
+STATUSES = (
+    "open",
+    "in_progress",
+    "resolved",
+    "ignored",
+    "false_positive",
+)
 SCAN_STATUSES = ("pending", "running", "completed", "failed")
 UNRESOLVED_STATUSES = ("open", "in_progress")
 
@@ -198,3 +209,59 @@ def get_dashboard_overview(
         "recent_scans": recent_scans,
         "most_affected_files": most_affected_files
     }
+
+
+@router.get(
+    "/trends",
+    response_model=SecurityTrendResponse,
+    summary="Get security trends from stored scan history",
+)
+def get_security_trends(
+    days: int = Query(default=30, ge=7, le=365),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    day = func.date(Scan.created_at).label("date")
+    unresolved = case(
+        (Finding.status.in_(UNRESOLVED_STATUSES), 1),
+        else_=0,
+    )
+
+    rows = db.execute(
+        select(
+            day,
+            func.count(distinct(Scan.id)).label("scans"),
+            func.count(Finding.id).label("findings"),
+            func.sum(
+                case((Finding.severity == "critical", 1), else_=0)
+            ).label("critical"),
+            func.sum(
+                case((Finding.severity == "high", 1), else_=0)
+            ).label("high"),
+            func.sum(unresolved).label("unresolved"),
+        )
+        .join(Repository, Scan.repository_id == Repository.id)
+        .outerjoin(Finding, Finding.scan_id == Scan.id)
+        .where(
+            Repository.owner_id == current_user.id,
+            Scan.created_at >= cutoff,
+        )
+        .group_by(day)
+        .order_by(day.asc())
+    ).all()
+
+    return SecurityTrendResponse(
+        days=days,
+        items=[
+            {
+                "date": row.date,
+                "scans": row.scans,
+                "findings": row.findings,
+                "critical": row.critical or 0,
+                "high": row.high or 0,
+                "unresolved": row.unresolved or 0,
+            }
+            for row in rows
+        ],
+    )

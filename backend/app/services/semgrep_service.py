@@ -12,6 +12,9 @@ class SemgrepError(Exception):
 
 
 class SemgrepService:
+    SCAN_CONFIG = "p/security-audit"
+    MAX_CONCURRENT_SCANS = 1
+
     SEVERITY_MAP = {
         "ERROR": "high",
         "WARNING": "medium",
@@ -20,6 +23,9 @@ class SemgrepService:
 
     MAX_OUTPUT_SIZE = 5 * 1024 * 1024
     MAX_FINDINGS = 1000
+
+    def __init__(self):
+        self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_SCANS)
 
     async def _stop_process(self, process):
         if process and process.returncode is None:
@@ -56,7 +62,25 @@ class SemgrepService:
 
         return normalized
 
+    def _build_command(self, executable: Path, root: Path) -> list[str]:
+        return [
+            str(executable),
+            "scan",
+            "--config", self.SCAN_CONFIG,
+            "--json",
+            "--quiet",
+            "--metrics=off",
+            "--no-git-ignore",
+            "--jobs", "1",
+            "--timeout", "10",
+            str(root),
+        ]
+
     async def scan(self, repository_path: str) -> dict:
+        async with self._semaphore:
+            return await self._scan(repository_path)
+
+    async def _scan(self, repository_path: str) -> dict:
         executable = Path(settings.SEMGREP_PATH).resolve()
         root = Path(repository_path).resolve()
 
@@ -70,18 +94,7 @@ class SemgrepService:
                 "Repository directory does not exist."
             )
 
-        command = [
-            str(executable),
-            "scan",
-            "--config", "auto",
-            "--json",
-            "--quiet",
-            "--metrics=off",
-            "--no-git-ignore",
-            "--jobs", "1",
-            "--timeout", "10",
-            str(root),
-        ]
+        command = self._build_command(executable, root)
 
         process = None
 
@@ -141,6 +154,9 @@ class SemgrepService:
                 "Semgrep execution failed: " + error_output[:300]
             )
 
+        return self._parse_output(output, root)
+
+    def _parse_output(self, output: bytes, root: Path) -> dict:
         try:
             data = json.loads(output.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -153,7 +169,7 @@ class SemgrepService:
                 "Semgrep returned an invalid response."
             )
 
-        results = data.get("results", [])
+        results = data.get("results")
 
         if not isinstance(results, list):
             raise SemgrepError(
@@ -163,28 +179,46 @@ class SemgrepService:
         errors = data.get("errors", [])
 
         if not isinstance(errors, list):
-            errors = []
+            raise SemgrepError(
+                "Semgrep returned an invalid errors list."
+            )
 
         findings = []
+        if len(results) > self.MAX_FINDINGS:
+            errors.append(
+                "Semgrep findings were truncated at the configured limit."
+            )
 
         for item in results[:self.MAX_FINDINGS]:
             if not isinstance(item, dict):
+                errors.append("Semgrep returned a malformed finding.")
                 continue
 
-            extra = item.get("extra") or {}
+            extra = item.get("extra")
 
             if not isinstance(extra, dict):
-                extra = {}
+                errors.append("Semgrep returned a finding with invalid metadata.")
+                continue
 
             metadata = extra.get("metadata") or {}
 
             if not isinstance(metadata, dict):
                 metadata = {}
 
-            start = item.get("start") or {}
+            start = item.get("start")
 
             if not isinstance(start, dict):
-                start = {}
+                errors.append("Semgrep returned a finding with an invalid location.")
+                continue
+
+            line_number = start.get("line")
+            if (
+                not isinstance(line_number, int)
+                or isinstance(line_number, bool)
+                or line_number < 1
+            ):
+                errors.append("Semgrep returned a finding with an invalid line.")
+                continue
 
             normalized_path = self._normalize_path(
                 str(item.get("path") or ""),
@@ -192,17 +226,13 @@ class SemgrepService:
             )
 
             if not normalized_path:
+                errors.append("Semgrep returned a finding with an invalid path.")
                 continue
 
             severity = self.SEVERITY_MAP.get(
                 str(extra.get("severity", "WARNING")).upper(),
                 "medium",
             )
-
-            line_number = start.get("line", 1)
-
-            if not isinstance(line_number, int) or line_number < 1:
-                line_number = 1
 
             message = str(
                 extra.get("message")

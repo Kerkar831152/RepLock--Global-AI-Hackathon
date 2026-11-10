@@ -27,6 +27,12 @@ router = APIRouter(
 @router.post(
     "/{repo_id}/merge-intelligence/analyze",
     response_model=MergeIntelligenceResponse,
+    summary="Analyze branch security and logical merge conflicts",
+    description=(
+        "Compares both branches against their common ancestor and uses "
+        "Bifrost to assess semantic incompatibilities. Conflict evidence is "
+        "validated against added lines from each branch."
+    ),
 )
 async def analyze_merge(
     repo_id: uuid.UUID,

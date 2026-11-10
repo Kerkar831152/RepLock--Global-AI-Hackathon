@@ -25,7 +25,27 @@ export interface MergeAnalysis {
   files_analyzed: number
   summary: string
   findings: MergeSecurityFinding[]
+  conflicts: LogicalMergeConflict[]
   limitations: string[]
+}
+
+export interface MergeConflictEvidence {
+  branch: string
+  file_path: string
+  line_start: number
+  line_end: number
+  code: string
+}
+
+export interface LogicalMergeConflict {
+  status: 'confirmed' | 'potential'
+  conflict_type: string
+  confidence: number
+  explanation: string
+  affected_files: string[]
+  related_symbols: string[]
+  dependency_description: string | null
+  evidence: MergeConflictEvidence[]
 }
 
 export const mergeIntelligenceService = {

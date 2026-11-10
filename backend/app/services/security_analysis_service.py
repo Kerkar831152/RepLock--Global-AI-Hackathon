@@ -4,6 +4,7 @@ import json
 from pydantic import ValidationError
 
 from app.schemas.security_analysis import (
+    SecurityFinding,
     SecurityAnalysisRequest,
     SecurityAnalysisResponse,
     ResearchSourceInput
@@ -192,12 +193,37 @@ Required JSON structure:
 
             parsed = self._parse_response(raw_response)
 
-            result = SecurityAnalysisResponse.model_validate(parsed)
+            raw_findings = parsed.get("findings")
+            if not isinstance(raw_findings, list):
+                raise ValueError("AI response findings must be a list")
+
+            response_data = dict(parsed)
+            response_data["findings"] = []
+            result = SecurityAnalysisResponse.model_validate(response_data)
+            findings_to_validate = raw_findings[:50]
+            if len(raw_findings) > len(findings_to_validate):
+                limitations.append(
+                    "AI findings beyond the 50-finding limit were rejected."
+                )
 
         except Exception as exc:
             raise SecurityAnalysisError(
                 "AI analysis returned an invalid response"
             ) from exc
+
+        for raw_finding in findings_to_validate:
+            try:
+                result.findings.append(
+                    SecurityFinding.model_validate(raw_finding)
+                )
+            except ValidationError as exc:
+                limitations.append(
+                    self._format_invalid_finding(
+                        raw_finding,
+                        files_by_path,
+                        exc,
+                    )
+                )
 
         result.limitations.extend(limitations)
 
@@ -239,6 +265,71 @@ Required JSON structure:
 
         return parsed
 
+    @staticmethod
+    def _format_invalid_finding(
+        raw_finding: object,
+        files_by_path: dict,
+        error: ValidationError,
+    ) -> str:
+        details = error.errors(include_input=False)
+        line_errors = [
+            item for item in details
+            if item.get("loc") in {("line_start",), ("line_end",)}
+            or (
+                item.get("loc") == ()
+                and "line_end" in item.get("msg", "")
+            )
+        ]
+        if not line_errors:
+            return "Rejected malformed AI finding: invalid finding data."
+
+        if isinstance(raw_finding, dict):
+            file_path = raw_finding.get("file_path")
+            line_start = raw_finding.get("line_start")
+            line_end = raw_finding.get("line_end")
+        else:
+            file_path = None
+            line_start = None
+            line_end = None
+
+        path_text = (
+            file_path[:300]
+            if isinstance(file_path, str)
+            else "<unknown file>"
+        )
+        source = (
+            files_by_path.get(file_path)
+            if isinstance(file_path, str)
+            else None
+        )
+        if source is None:
+            allowed_range = "unavailable (file is not in submitted context)"
+        else:
+            context_end = (
+                source.start_line + len(source.content.splitlines()) - 1
+            )
+            original_line_count = source.original_line_count
+            allowed_end = (
+                min(context_end, original_line_count)
+                if original_line_count is not None
+                else context_end
+            )
+            allowed_range = (
+                f"{source.start_line}-{allowed_end}"
+                if source.start_line <= allowed_end
+                else "none (submitted context is outside the original file)"
+            )
+
+        reason = "; ".join(
+            str(item.get("msg", "invalid line range"))
+            for item in line_errors
+        )[:200]
+        return (
+            f"Rejected finding with invalid line range in {path_text}: "
+            f"received {line_start!r}-{line_end!r}; allowed range "
+            f"{allowed_range}; reason: {reason}."
+        )
+
     def _validate_evidence(
         self,
         result: SecurityAnalysisResponse,
@@ -267,16 +358,41 @@ Required JSON structure:
             lines = source.content.splitlines()
 
             source_start = source.start_line
-            source_end = source_start + len(lines) - 1
+            context_end = source_start + len(lines) - 1
+            source_end = (
+                min(context_end, source.original_line_count)
+                if source.original_line_count is not None
+                else context_end
+            )
 
             if (
                 finding.line_start < source_start
                 or finding.line_start > finding.line_end
+                or finding.line_end > context_end
                 or finding.line_end > source_end
             ):
+                if finding.line_start > finding.line_end:
+                    reason = "the end line is before the start line"
+                elif finding.line_start < source_start:
+                    reason = "the start line is before the submitted context"
+                elif (
+                    source.original_line_count is not None
+                    and finding.line_end > source.original_line_count
+                ):
+                    reason = "the end line is outside the original file"
+                else:
+                    reason = "the range extends beyond the submitted context"
+
+                allowed_range = (
+                    f"{source_start}-{source_end}"
+                    if source_start <= source_end
+                    else "none (submitted context is outside the original file)"
+                )
                 limitations.append(
-                    "Rejected finding with invalid line range: "
-                    + finding.file_path
+                    "Rejected finding with invalid line range in "
+                    f"{finding.file_path}: received "
+                    f"{finding.line_start}-{finding.line_end}; allowed "
+                    f"range {allowed_range}; reason: {reason}."
                 )
                 continue
 

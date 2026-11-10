@@ -18,6 +18,7 @@ export type FindingStatus =
   | 'open'
   | 'in_progress'
   | 'resolved'
+  | 'ignored'
   | 'false_positive'
 
 export const vulnerabilityService = {

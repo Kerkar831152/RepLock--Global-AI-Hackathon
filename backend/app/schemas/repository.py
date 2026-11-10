@@ -2,11 +2,11 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RepositoryCreate(BaseModel):
-    github_repo_id: str
+    github_repo_id: str = Field(pattern=r"^\d{1,100}$")
 
 
 class RepositoryResponse(BaseModel):

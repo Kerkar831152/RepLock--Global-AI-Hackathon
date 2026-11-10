@@ -64,7 +64,10 @@ def github_login():
         key="github_oauth_state",
         value=state,
         httponly=True,
-        secure=False,
+        secure=bool(
+            GITHUB_CALLBACK_URL
+            and GITHUB_CALLBACK_URL.lower().startswith("https://")
+        ),
         samesite="lax",
         max_age=600,
         path="/api/v1/auth",

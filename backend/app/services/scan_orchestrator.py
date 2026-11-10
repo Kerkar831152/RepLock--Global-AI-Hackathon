@@ -1,4 +1,6 @@
 
+import asyncio
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -27,7 +29,11 @@ class ScanOrchestrationError(Exception):
     pass
 
 
+logger = logging.getLogger(__name__)
+
+
 class ScanOrchestrator:
+    MAX_CONCURRENT_SCANS = 1
     MAX_AI_FILES = 3
     MAX_AI_FILE_CHARS = 4000
     MAX_AI_TOTAL_CHARS = 8000
@@ -67,6 +73,9 @@ class ScanOrchestrator:
         "info": 4,
     }
 
+    def __init__(self):
+        self._semaphore = asyncio.Semaphore(self.MAX_CONCURRENT_SCANS)
+
     def _normalize_repo_path(self, value: str) -> str | None:
         if not isinstance(value, str):
             return None
@@ -95,6 +104,10 @@ class ScanOrchestrator:
         return self.SEVERITY_ORDER.get(value.lower(), 4)
 
     async def run(self, repository, access_token: str) -> dict:
+        async with self._semaphore:
+            return await self._run(repository, access_token)
+
+    async def _run(self, repository, access_token: str) -> dict:
         with tempfile.TemporaryDirectory(prefix="replock_") as temp:
             repository_path = Path(temp) / "source"
 
@@ -107,6 +120,7 @@ class ScanOrchestrator:
             except RepositoryDownloadError as exc:
                 raise ScanOrchestrationError(str(exc)) from exc
             except Exception as exc:
+                logger.exception("Repository download failed unexpectedly")
                 raise ScanOrchestrationError(
                     "Repository download failed unexpectedly"
                 ) from exc
@@ -118,6 +132,7 @@ class ScanOrchestrator:
             except SemgrepError as exc:
                 raise ScanOrchestrationError(str(exc)) from exc
             except Exception as exc:
+                logger.exception("Security scanner failed unexpectedly")
                 raise ScanOrchestrationError(
                     "Security scanner failed unexpectedly"
                 ) from exc
@@ -177,6 +192,7 @@ class ScanOrchestrator:
                         path=item["path"],
                         content=item["content"],
                         start_line=item["start_line"],
+                        original_line_count=item["original_line_count"],
                     )
                     for item in selected_files
                 ],
@@ -194,6 +210,7 @@ class ScanOrchestrator:
                     "AI security analysis could not be completed"
                 ) from exc
             except Exception as exc:
+                logger.exception("AI security analysis failed unexpectedly")
                 raise ScanOrchestrationError(
                     "AI security analysis failed unexpectedly"
                 ) from exc
@@ -222,6 +239,18 @@ class ScanOrchestrator:
 
             limitations = list(analysis.limitations)
             limitations.extend(source_limitations)
+
+            if total_findings == 0:
+                limitations.append(
+                    "Semgrep detected no findings; this does not establish "
+                    "that the repository is free of vulnerabilities."
+                )
+
+            if isinstance(scanner_errors, list) and scanner_errors:
+                limitations.append(
+                    "Semgrep reported scanner warnings; its results may be "
+                    "incomplete."
+                )
 
             if len(scanner_signals) < total_findings:
                 limitations.append(
@@ -417,6 +446,9 @@ class ScanOrchestrator:
                 "path": item["path"],
                 "content": content,
                 "start_line": start_line,
+                "original_line_count": len(
+                    item["content"].splitlines()
+                ),
             })
 
             total_chars += len(content)
@@ -441,6 +473,12 @@ class ScanOrchestrator:
         lines = content.splitlines()
 
         if not lines:
+            return None
+
+        if len(content) <= self.MAX_AI_FILE_CHARS:
+            if content.strip():
+                return content, 1
+
             return None
 
         target_line = self._safe_line_number(target_line)

@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -25,6 +27,9 @@ router = APIRouter(
     prefix="/repositories",
     tags=["Pull Requests"]
 )
+logger = logging.getLogger(__name__)
+# Bump this when review analysis or attribution semantics change.
+PR_REVIEW_VERSION = 1
 
 
 def get_owned_repository(
@@ -80,6 +85,7 @@ def get_existing_review(
             Scan.pull_request_number == number,
             Scan.commit_sha == head_sha,
             Scan.scan_type == "pull_request",
+            Scan.review_version == PR_REVIEW_VERSION,
             Scan.status.in_(["running", "completed"])
         )
         .limit(1)
@@ -106,19 +112,24 @@ def build_existing_review_response(
         head_sha=scan.commit_sha,
         status=scan.status,
         summary=scan.summary or "",
+        changed_files=scan.changed_files or 0,
         files_analyzed=scan.files_analyzed or 0,
         findings=[
             FindingResponse.model_validate(item)
             for item in findings
         ],
-        limitations=[
+        limitations=list(scan.limitations or []) + [
             "This pull request commit has already been reviewed. "
             "The previously saved review is being returned."
-        ]
+        ],
     )
 
 
-def mark_scan_failed(db: Session, scan_id: uuid.UUID):
+def mark_scan_failed(
+    db: Session,
+    scan_id: uuid.UUID,
+    failure_summary: str = "Pull request security review failed",
+):
     try:
         db.rollback()
 
@@ -126,11 +137,13 @@ def mark_scan_failed(db: Session, scan_id: uuid.UUID):
 
         if scan:
             scan.status = "failed"
+            scan.summary = failure_summary
             scan.completed_at = datetime.now(timezone.utc)
             db.commit()
 
     except SQLAlchemyError:
         db.rollback()
+        logger.exception("Unable to persist failed PR review %s", scan_id)
 
 
 @router.get(
@@ -165,7 +178,13 @@ async def list_repository_pull_requests(
 
 @router.post(
     "/{repo_id}/pull-requests/{number}/review",
-    response_model=PullRequestReviewResponse
+    response_model=PullRequestReviewResponse,
+    summary="Review the current pull request head",
+    description=(
+        "Reviews added code in the current PR head. A completed review is "
+        "reused only for the same repository, PR number, head SHA, and review "
+        "version; a changed head or review version triggers fresh analysis."
+    ),
 )
 async def review_pull_request(
     repo_id: uuid.UUID,
@@ -225,6 +244,8 @@ async def review_pull_request(
         repository_id=repository.id,
         commit_sha=metadata["head_sha"],
         pull_request_number=number,
+        changed_files=metadata["changed_files"],
+        review_version=PR_REVIEW_VERSION,
         files_analyzed=0,
         status="running",
         scan_type="pull_request",
@@ -280,8 +301,10 @@ async def review_pull_request(
         analysis = review["analysis"]
 
         scan.commit_sha = review["head_sha"]
+        scan.changed_files = review["changed_files"]
         scan.files_analyzed = review["files_analyzed"]
         scan.summary = analysis.summary
+        scan.limitations = review["limitations"]
         scan.status = "completed"
         scan.completed_at = datetime.now(timezone.utc)
 
@@ -318,6 +341,7 @@ async def review_pull_request(
             head_sha=review["head_sha"],
             status=scan.status,
             summary=analysis.summary,
+            changed_files=review["changed_files"],
             files_analyzed=review["files_analyzed"],
             findings=[
                 FindingResponse.model_validate(item)
@@ -325,6 +349,14 @@ async def review_pull_request(
             ],
             limitations=review["limitations"]
         )
+
+    except asyncio.CancelledError:
+        mark_scan_failed(
+            db,
+            scan.id,
+            "Pull request security review was cancelled",
+        )
+        raise
 
     except PullRequestError as exc:
         mark_scan_failed(db, scan.id)

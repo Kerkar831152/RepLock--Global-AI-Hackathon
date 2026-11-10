@@ -31,11 +31,28 @@ export interface DashboardOverview {
   }[]
 }
 
+export interface SecurityTrendPoint {
+  date: string
+  scans: number
+  findings: number
+  critical: number
+  high: number
+  unresolved: number
+}
+
 export const dashboardService = {
   async overview(): Promise<DashboardOverview> {
     const { data } = await api.get<DashboardOverview>(
       '/dashboard/overview',
     )
     return data
+  },
+
+  async trends(days = 30): Promise<SecurityTrendPoint[]> {
+    const { data } = await api.get<{ days: number; items: SecurityTrendPoint[] }>(
+      '/dashboard/trends',
+      { params: { days } },
+    )
+    return data.items
   },
 }

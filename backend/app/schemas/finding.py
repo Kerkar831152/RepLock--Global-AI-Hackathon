@@ -6,7 +6,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 FindingSeverity = Literal["critical", "high", "medium", "low", "info"]
-FindingStatus = Literal["open", "in_progress", "resolved", "false_positive"]
+FindingStatus = Literal[
+    "open",
+    "in_progress",
+    "resolved",
+    "ignored",
+    "false_positive",
+]
 
 
 class FindingCreate(BaseModel):

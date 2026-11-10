@@ -1,12 +1,16 @@
 import {
+  useCallback,
   createContext,
   lazy,
   Suspense,
   useContext,
   useEffect,
+  useLayoutEffect,
+  useRef,
   useState,
   type ReactNode,
 } from 'react'
+import { createPortal } from 'react-dom'
 import {
   BrowserRouter,
   Link,
@@ -42,6 +46,7 @@ import {
   Layers3,
   LoaderCircle,
   LockKeyhole,
+  LogOut,
   Menu,
   MoreHorizontal,
   Plus,
@@ -62,15 +67,15 @@ import {
 import { healthApi, getApiErrorMessage } from './services/api'
 import { authService } from './services/auth'
 import { repositoryService } from './services/repositories'
-import { scanService } from './services/scans'
-import type { ScanFinding, ScanRunResult } from './services/scans'
+import { isScanRequestTimeout, scanService } from './services/scans'
+import type { ScanFinding, ScanRecord, ScanRunResult } from './services/scans'
 import { dashboardService } from './services/dashboard'
 import { pullRequestService } from './services/pullRequests'
 import type {
   PullRequest,
   PullRequestReview,
 } from './services/pullRequests'
-import { downloadReport } from './services/reports'
+import { downloadReport, reportService } from './services/reports'
 import type { FindingStatus } from './services/vulnerabilities'
 import type { ConnectedRepository } from './services/repositories'
 import { vulnerabilityService } from './services/vulnerabilities'
@@ -183,7 +188,6 @@ function GithubMark({ size = 16 }: { size?: number }) {
 function AppLayout() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const location = useLocation()
-  const navigate = useNavigate()
 
   const health = useQuery({
     queryKey: ['api-health'],
@@ -300,19 +304,11 @@ function AppLayout() {
             <MoreHorizontal size={17} />
           </div>
 
-          <button
-            className="profile-button"
-            onClick={() => navigate('/settings')}
-          >
-            <div className="profile-avatar">{initials}</div>
-            <div className="profile-copy">
-              <strong>{username}</strong>
-              <span>
-                {account.isSuccess ? 'GitHub account' : 'Not signed in'}
-              </span>
-            </div>
-            <ChevronDown size={15} />
-          </button>
+          <ProfileDropdown
+            username={username}
+            email={account.data?.email}
+            initials={initials}
+          />
         </div>
       </aside>
 
@@ -349,10 +345,12 @@ function AppLayout() {
 
             <span className="topbar-divider" />
 
-            <div className="topbar-user">
-              <div className="profile-avatar">{initials}</div>
-              <ChevronDown size={14} />
-            </div>
+            <ProfileDropdown
+              username={username}
+              email={account.data?.email}
+              initials={initials}
+              compact
+            />
           </div>
         </header>
 
@@ -366,6 +364,183 @@ function AppLayout() {
           <span>{health.isSuccess ? 'API connected' : 'API unavailable'}</span>
         </footer>
       </div>
+    </div>
+  )
+}
+
+function ProfileDropdown({
+  username,
+  email,
+  initials,
+  compact = false,
+}: {
+  username: string
+  email?: string | null
+  initials: string
+  compact?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [menuPosition, setMenuPosition] = useState<{ top: number; left: number } | null>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+
+  useEffect(() => {
+    if (!open) return
+
+    const closeOutside = (event: PointerEvent) => {
+      const target = event.target as Node
+      if (
+        !containerRef.current?.contains(target) &&
+        !menuRef.current?.contains(target)
+      ) {
+        setOpen(false)
+      }
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+        triggerRef.current?.focus()
+        return
+      }
+
+      if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+
+      const items = Array.from(
+        menuRef.current?.querySelectorAll<HTMLElement>(
+          '[role="menuitem"]:not([aria-disabled="true"])',
+        ) ?? [],
+      )
+      if (!items.length) return
+
+      event.preventDefault()
+      const currentIndex = items.indexOf(document.activeElement as HTMLElement)
+      const direction = event.key === 'ArrowDown' ? 1 : -1
+      const nextIndex =
+        currentIndex < 0
+          ? direction > 0
+            ? 0
+            : items.length - 1
+          : (currentIndex + direction + items.length) % items.length
+      items[nextIndex]?.focus()
+    }
+
+    document.addEventListener('pointerdown', closeOutside)
+    document.addEventListener('keydown', handleKeyDown)
+
+    return () => {
+      document.removeEventListener('pointerdown', closeOutside)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [open])
+
+  useLayoutEffect(() => {
+    if (!open) return
+
+    const updatePosition = () => {
+      const trigger = triggerRef.current?.getBoundingClientRect()
+      const menu = menuRef.current?.getBoundingClientRect()
+      if (!trigger || !menu) return
+
+      const top = compact
+        ? trigger.bottom + 8
+        : Math.max(8, trigger.top - menu.height - 8)
+      const left = compact
+        ? trigger.right - menu.width
+        : trigger.left
+
+      setMenuPosition({
+        top: Math.min(top, window.innerHeight - menu.height - 8),
+        left: Math.max(8, Math.min(left, window.innerWidth - menu.width - 8)),
+      })
+    }
+
+    updatePosition()
+    menuRef.current
+      ?.querySelector<HTMLElement>('[role="menuitem"]')
+      ?.focus()
+    window.addEventListener('resize', updatePosition)
+    window.addEventListener('scroll', updatePosition, true)
+
+    return () => {
+      window.removeEventListener('resize', updatePosition)
+      window.removeEventListener('scroll', updatePosition, true)
+    }
+  }, [open, compact])
+
+  const signOut = () => {
+    authService.clearAccessToken()
+    queryClient.clear()
+    navigate('/login', { replace: true })
+  }
+
+  return (
+    <div
+      className={`profile-menu-wrap ${compact ? 'profile-menu-header' : ''}`}
+      ref={containerRef}
+    >
+      <button
+        ref={triggerRef}
+        className={compact ? 'topbar-user' : 'profile-button'}
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={compact ? 'profile-menu-header' : 'profile-menu-sidebar'}
+        aria-label={`Profile menu for ${username}`}
+        onClick={() => setOpen((value) => !value)}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowDown' && !open) {
+            event.preventDefault()
+            setOpen(true)
+          }
+        }}
+      >
+        <div className="profile-avatar">{initials}</div>
+        {!compact && (
+          <div className="profile-copy">
+            <strong>{username}</strong>
+            <span>{email || 'GitHub account'}</span>
+          </div>
+        )}
+        <ChevronDown size={compact ? 14 : 15} />
+      </button>
+
+      {open &&
+        createPortal(
+          <div
+            className="profile-menu"
+            id={compact ? 'profile-menu-header' : 'profile-menu-sidebar'}
+            role="menu"
+            aria-label="Profile"
+            ref={menuRef}
+            style={
+              menuPosition
+                ? { top: menuPosition.top, left: menuPosition.left, visibility: 'visible' }
+                : undefined
+            }
+          >
+            <div className="profile-menu-account">
+              <strong>{username}</strong>
+              {email && <span>{email}</span>}
+            </div>
+            <Link
+              to="/settings"
+              role="menuitem"
+              onClick={() => setOpen(false)}
+            >
+              <SlidersHorizontal size={15} />
+              Settings
+            </Link>
+            <button type="button" role="menuitem" onClick={signOut}>
+              <LogOut size={15} />
+              Sign out
+            </button>
+          </div>,
+          document.body,
+        )}
     </div>
   )
 }
@@ -637,6 +812,12 @@ function OverviewPage() {
   const overview = useQuery({
     queryKey: ['dashboard-overview'],
     queryFn: dashboardService.overview,
+    retry: false,
+  })
+
+  const trends = useQuery({
+    queryKey: ['dashboard-trends', 30],
+    queryFn: () => dashboardService.trends(30),
     retry: false,
   })
 
@@ -953,6 +1134,55 @@ function OverviewPage() {
               </div>
             </section>
           </div>
+
+          <section className="panel trend-panel">
+            <PanelHeading
+              title="Security activity"
+              subtitle="Stored scan and finding trends over the last 30 days"
+            />
+
+            {trends.isLoading ? (
+              <div className="empty-state">
+                <LoaderCircle size={18} className="spin" />
+                Loading security trends…
+              </div>
+            ) : trends.isError ? (
+              <div className="callout callout-warning">
+                <TriangleAlert size={16} />
+                {getApiErrorMessage(trends.error)}
+                <Button
+                  variant="secondary"
+                  onClick={() => void trends.refetch()}
+                >
+                  <RefreshCw size={14} /> Retry
+                </Button>
+              </div>
+            ) : trends.data?.length ? (
+              <div className="trend-list">
+                {trends.data.slice(-7).map((point) => (
+                  <div className="trend-row" key={point.date}>
+                    <time>
+                      {new Date(`${point.date}T00:00:00`).toLocaleDateString()}
+                    </time>
+                    <span>{point.scans} scans</span>
+                    <span>{point.findings} findings</span>
+                    <span className="trend-risk">
+                      {point.critical} critical · {point.high} high
+                    </span>
+                    <StatusBadge tone={point.unresolved ? 'warning' : 'success'}>
+                      {point.unresolved} unresolved
+                    </StatusBadge>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">
+                <Activity size={18} />
+                <strong>No scan activity in this period</strong>
+                <span>Trend data appears after a scan is recorded.</span>
+              </div>
+            )}
+          </section>
         </>
       ) : null}
     </>
@@ -1227,6 +1457,23 @@ function ScanningPage() {
   const queryClient = useQueryClient()
   const [repositoryId, setRepositoryId] = useState('')
   const [scanType, setScanType] = useState<'full' | 'static'>('full')
+  const [scanIssue, setScanIssue] = useState<{
+    message: string
+    status: 'failed' | 'unknown' | 'completed'
+  } | null>(null)
+  const [pendingScan, setPendingScan] = useState<{
+    scanId?: string
+    repositoryId: string
+    repositoryName: string
+    requestedAt: number
+  } | null>(null)
+  const scanAttemptRef = useRef<{
+    scanId?: string
+    repositoryId: string
+    repositoryName: string
+    requestedAt: number
+  } | null>(null)
+  const recoveringScanRef = useRef<string | null>(null)
   const [result, setResult] = useState<{
     scan: ScanRunResult
     repositoryName: string
@@ -1243,28 +1490,293 @@ function ScanningPage() {
     queryKey: ['scan-history'],
     queryFn: scanService.list,
     enabled: Boolean(authService.getAccessToken()),
+    refetchInterval: (query) => {
+      const hasUntrackedActiveScan = Boolean(
+        query.state.data?.some(
+          (scan) =>
+            scan.id !== pendingScan?.scanId &&
+            (scan.status === 'pending' || scan.status === 'running'),
+        ),
+      )
+      return Boolean(pendingScan && !pendingScan.scanId) ||
+        hasUntrackedActiveScan
+        ? 5000
+        : false
+    },
   })
 
-  const runScan = useMutation({
-    mutationFn: () => scanService.run(repositoryId, scanType),
-    onSuccess: async (data) => {
-      const repo = repos.data?.find((item) => item.id === repositoryId)
+  const pendingStatus = useQuery({
+    queryKey: ['scan-status', pendingScan?.scanId],
+    queryFn: () => {
+      if (!pendingScan?.scanId) {
+        throw new Error('A scan ID is required to fetch scan status.')
+      }
+      return scanService.get(pendingScan.scanId)
+    },
+    enabled: Boolean(pendingScan?.scanId),
+    refetchInterval: (query) =>
+      pendingScan &&
+      query.state.data?.status !== 'completed' &&
+      query.state.data?.status !== 'failed'
+        ? 5000
+        : false,
+  })
 
+  const pendingScanCandidates = pendingScan?.scanId
+    ? pendingStatus.data
+      ? [pendingStatus.data]
+      : []
+    : history.data ?? []
+  const pendingScanRecord = pendingScan
+    ? pendingScanCandidates
+        .filter(
+          (scan) =>
+            scan.id === pendingScan.scanId ||
+            (scan.repository_id === pendingScan.repositoryId &&
+              Date.parse(scan.created_at) >= pendingScan.requestedAt),
+        )
+        .sort(
+          (left, right) =>
+            Date.parse(right.created_at) - Date.parse(left.created_at),
+        )[0]
+    : undefined
+  const pendingScanFailed = pendingScanRecord?.status === 'failed'
+  const visibleScanIssue = pendingScanFailed
+    ? {
+        message:
+          pendingScanRecord.summary ||
+          'The failed scan did not include additional error details.',
+        status: 'failed' as const,
+      }
+    : scanIssue
+
+  const recoverCompletedScan = useCallback(async (
+    scan: ScanRecord,
+    repositoryName: string,
+  ) => {
+    try {
+      const findings = await vulnerabilityService.listAllForScan(scan.id)
       setResult({
-        scan: data,
-        repositoryName: repo?.full_name ?? 'Connected repository',
+        repositoryName,
+        scan: {
+          scan,
+          findings,
+          semgrep_findings: scan.semgrep_findings ?? null,
+          files_analyzed: scan.files_analyzed ?? null,
+          limitations: scan.limitations ?? null,
+        },
       })
-
-      notify('Security scan completed.', 'success')
-      await Promise.all([
-        history.refetch(),
+      setScanIssue(null)
+      setPendingScan(null)
+      notify(
+        'The completed scan was recovered from persisted scan history.',
+        'success',
+      )
+      void Promise.allSettled([
         queryClient.invalidateQueries({ queryKey: ['dashboard-overview'] }),
+        queryClient.invalidateQueries({ queryKey: ['dashboard-trends'] }),
         queryClient.invalidateQueries({ queryKey: ['findings'] }),
         queryClient.invalidateQueries({ queryKey: ['finding-summary'] }),
       ])
+    } catch (error) {
+      setScanIssue({
+        message: `The scan completed and was saved, but its findings could not be loaded: ${getApiErrorMessage(error)}`,
+        status: 'completed',
+      })
+      setPendingScan(null)
+    } finally {
+      recoveringScanRef.current = null
+      void queryClient.invalidateQueries({ queryKey: ['scan-history'] })
+    }
+  }, [notify, queryClient])
+
+  useEffect(() => {
+    if (!pendingScan) return
+
+    const scan = (pendingStatus.data
+      ? [pendingStatus.data]
+      : history.data ?? [])
+      .filter(
+        (item) =>
+          pendingScan.scanId
+            ? item.id === pendingScan.scanId
+            : item.repository_id === pendingScan.repositoryId &&
+              Date.parse(item.created_at) >= pendingScan.requestedAt,
+      )
+      .sort(
+        (left, right) =>
+          Date.parse(right.created_at) - Date.parse(left.created_at),
+      )[0]
+
+    if (!scan || scan.status === 'pending' || scan.status === 'running') return
+
+    if (scan.status === 'completed') {
+      if (recoveringScanRef.current === scan.id) return
+      recoveringScanRef.current = scan.id
+      void recoverCompletedScan(scan, pendingScan.repositoryName)
+    }
+  }, [history.data, pendingStatus.data, pendingScan, recoverCompletedScan])
+
+  const runScan = useMutation({
+    mutationFn: () => scanService.start(repositoryId, scanType),
+    onSuccess: (data) => {
+      const repo = repos.data?.find((item) => item.id === repositoryId)
+      scanAttemptRef.current = null
+
+      const attempt = {
+        scanId: data.id,
+        repositoryId: data.repository_id,
+        repositoryName: repo?.full_name ?? 'Connected repository',
+        requestedAt: Date.parse(data.created_at),
+      }
+      setPendingScan(attempt)
+      setScanIssue(null)
+      notify('Security scan queued. RepLock will track its progress.', 'success')
+      void Promise.allSettled([
+        history.refetch(),
+        queryClient.invalidateQueries({ queryKey: ['dashboard-overview'] }),
+        queryClient.invalidateQueries({ queryKey: ['dashboard-trends'] }),
+      ])
     },
-    onError: (error) => notify(getApiErrorMessage(error), 'error'),
+    onError: async (error) => {
+      const attempt = scanAttemptRef.current
+      scanAttemptRef.current = null
+      const refreshedHistory = await history.refetch()
+      const matchingScan = attempt
+        ? refreshedHistory.data
+            ?.filter(
+              (scan) =>
+                (attempt.scanId
+                  ? scan.id === attempt.scanId
+                  : scan.repository_id === attempt.repositoryId &&
+                    Date.parse(scan.created_at) >= attempt.requestedAt),
+            )
+            .sort(
+              (left, right) =>
+                Date.parse(right.created_at) - Date.parse(left.created_at),
+            )[0]
+        : undefined
+
+      if (
+        (matchingScan?.status === 'pending' ||
+          matchingScan?.status === 'running') &&
+        attempt
+      ) {
+        setPendingScan({
+          ...attempt,
+          scanId: matchingScan.id,
+          requestedAt: Date.parse(matchingScan.created_at),
+        })
+        setScanIssue({
+          message:
+            'The request did not return a confirmation, but the scan is recorded on the server. RepLock will continue checking its status.',
+          status: 'unknown',
+        })
+        notify('Scan status is being checked in scan history.', 'info')
+      } else if (matchingScan?.status === 'completed' && attempt) {
+        await recoverCompletedScan(matchingScan, attempt.repositoryName)
+      } else if (matchingScan?.status === 'failed') {
+        setScanIssue({
+          message: matchingScan.summary || getApiErrorMessage(error),
+          status: 'failed',
+        })
+        notify(matchingScan.summary || getApiErrorMessage(error), 'error')
+      } else if (isScanRequestTimeout(error) && attempt) {
+        setPendingScan(attempt)
+        setScanIssue({
+          message:
+            'The request timed out before the API confirmed whether it accepted the scan. RepLock will check history before allowing another scan.',
+          status: 'unknown',
+        })
+        notify('Scan outcome is being checked in scan history.', 'info')
+      } else {
+        const message = getApiErrorMessage(error)
+        setScanIssue({ message, status: 'failed' })
+        notify(message, 'error')
+      }
+
+      void Promise.allSettled([
+        queryClient.invalidateQueries({ queryKey: ['dashboard-overview'] }),
+      ])
+    },
   })
+
+  const activeScan = history.data?.find(
+    (scan) =>
+      scan.repository_id === repositoryId &&
+      scan.id !== pendingScan?.scanId &&
+      (scan.status === 'pending' || scan.status === 'running'),
+  )
+
+  const startScan = () => {
+    if (
+      !repositoryId ||
+      runScan.isPending ||
+      (pendingScan && !pendingScanFailed) ||
+      activeScan ||
+      scanAttemptRef.current
+    ) {
+      return
+    }
+
+    const repo = repos.data?.find((item) => item.id === repositoryId)
+    setPendingScan(null)
+    scanAttemptRef.current = {
+      repositoryId,
+      repositoryName: repo?.full_name ?? 'Connected repository',
+      requestedAt: Date.now(),
+    }
+    setResult(null)
+    setScanIssue(null)
+    runScan.mutate()
+  }
+
+  const refreshScanStatus = async () => {
+    if (!pendingScan) return
+    let scanRecords: ScanRecord[]
+    if (pendingScan.scanId) {
+      const refreshedStatus = await pendingStatus.refetch()
+      scanRecords = refreshedStatus.data ? [refreshedStatus.data] : []
+    } else {
+      const refreshedHistory = await history.refetch()
+      scanRecords = refreshedHistory.data ?? []
+    }
+
+    const scan = scanRecords
+      .filter(
+        (item) =>
+          pendingScan.scanId
+            ? item.id === pendingScan.scanId
+            : item.repository_id === pendingScan.repositoryId &&
+              Date.parse(item.created_at) >= pendingScan.requestedAt,
+      )
+      .sort(
+        (left, right) =>
+          Date.parse(right.created_at) - Date.parse(left.created_at),
+      )[0]
+    if (!scan) {
+      setPendingScan(null)
+      setScanIssue({
+        message:
+          'No scan record was created for the request. It is now safe to retry.',
+        status: 'failed',
+      })
+      return
+    }
+
+    if (scan.status === 'failed') {
+      setPendingScan(null)
+      setScanIssue({
+        message: scan.summary || 'The security scan failed.',
+        status: 'failed',
+      })
+    }
+    if (scan.status === 'completed') {
+      if (recoveringScanRef.current === scan.id) return
+      recoveringScanRef.current = scan.id
+      await recoverCompletedScan(scan, pendingScan.repositoryName)
+    }
+  }
 
   if (!authService.getAccessToken()) {
     return (
@@ -1325,9 +1837,14 @@ function ScanningPage() {
                   <select
                     id="scan-repository"
                     value={repositoryId}
+                    disabled={
+                      runScan.isPending ||
+                      Boolean(pendingScan && !pendingScanFailed)
+                    }
                     onChange={(event) => {
                       setRepositoryId(event.target.value)
                       setResult(null)
+                      setScanIssue(null)
                     }}
                   >
                     <option value="">Select repository</option>
@@ -1349,9 +1866,14 @@ function ScanningPage() {
                   <select
                     id="scan-type"
                     value={scanType}
+                    disabled={
+                      runScan.isPending ||
+                      Boolean(pendingScan && !pendingScanFailed)
+                    }
                     onChange={(event) => {
                       setScanType(event.target.value as 'full' | 'static')
                       setResult(null)
+                      setScanIssue(null)
                     }}
                   >
                     <option value="full">Full security scan</option>
@@ -1363,21 +1885,30 @@ function ScanningPage() {
             </div>
 
             <div className="scan-config-footer">
-              <div>
-                <ShieldCheck size={16} />
-                <span>
-                  {selectedRepo
-                    ? `Default branch: ${selectedRepo.default_branch}`
-                    : 'Select a repository to begin'}
+              <div className="scan-branch-info">
+                <span className="scan-branch-icon">
+                  <ShieldCheck size={17} />
                 </span>
+                <div className="scan-branch-copy">
+                  <span className="scan-branch-label">
+                    Default branch
+                  </span>
+                  <strong>
+                    {selectedRepo
+                      ? selectedRepo.default_branch
+                      : 'Select a repository to begin'}
+                  </strong>
+                </div>
               </div>
 
               <Button
-                disabled={!repositoryId || runScan.isPending}
-                onClick={() => {
-                  setResult(null)
-                  runScan.mutate()
-                }}
+                disabled={
+                  !repositoryId ||
+                  runScan.isPending ||
+                  Boolean(pendingScan && !pendingScanFailed) ||
+                  Boolean(activeScan)
+                }
+                onClick={startScan}
               >
                 {runScan.isPending ? (
                   <LoaderCircle size={15} className="spin" />
@@ -1398,9 +1929,56 @@ function ScanningPage() {
             </Link>
           </div>
         )}
+        {activeScan && (
+          <div className="callout callout-info scan-active">
+            <LoaderCircle size={16} className="spin" />
+            <span>
+              A scan for this repository is already running. Refresh history
+              for its latest status.
+            </span>
+            <Button
+              variant="secondary"
+              onClick={() => void history.refetch()}
+            >
+              <RefreshCw size={14} /> Refresh
+            </Button>
+          </div>
+        )}
       </section>
 
-      {runScan.isPending && (
+      {visibleScanIssue && (
+        <div
+          className={`callout ${visibleScanIssue.status === 'unknown' ? 'callout-info' : 'callout-warning'} scan-error`}
+          role="alert"
+        >
+          {visibleScanIssue.status === 'unknown' ? (
+            <LoaderCircle size={16} className="spin" />
+          ) : visibleScanIssue.status === 'completed' ? (
+            <CheckCircle2 size={16} />
+          ) : (
+            <TriangleAlert size={16} />
+          )}
+          <span>{visibleScanIssue.message}</span>
+          <Button
+            variant="secondary"
+            disabled={runScan.isPending}
+            onClick={() =>
+              visibleScanIssue.status === 'failed' &&
+              (!pendingScan || pendingScanFailed)
+                ? startScan()
+                : void refreshScanStatus()
+            }
+          >
+            <RefreshCw size={14} />
+            {visibleScanIssue.status === 'failed' &&
+            (!pendingScan || pendingScanFailed)
+              ? 'Retry scan'
+              : 'Refresh status'}
+          </Button>
+        </div>
+      )}
+
+      {(runScan.isPending || Boolean(pendingScan && !pendingScanFailed)) && (
         <section className="panel scan-progress-panel">
           <div className="scan-progress-heading">
             <LoaderCircle size={19} className="spin" />
@@ -1432,7 +2010,7 @@ function ScanningPage() {
           <div className="metric-grid">
             <MetricCard
               label="Files analyzed"
-              value={String(result.scan.files_analyzed)}
+              value={result.scan.files_analyzed == null ? '—' : String(result.scan.files_analyzed)}
               icon={<FileCode2 size={17} />}
               detail="Files inspected"
             />
@@ -1444,7 +2022,7 @@ function ScanningPage() {
             />
             <MetricCard
               label="Semgrep findings"
-              value={String(result.scan.semgrep_findings)}
+              value={result.scan.semgrep_findings == null ? '—' : String(result.scan.semgrep_findings)}
               icon={<Activity size={17} />}
               detail="Static analyzer output"
             />
@@ -1495,7 +2073,12 @@ function ScanningPage() {
             )}
           </div>
 
-          {result.scan.limitations.length > 0 && (
+          {result.scan.limitations == null ? (
+            <div className="callout callout-warning">
+              <TriangleAlert size={16} />
+              <span>Scan limitations were not recorded for this assessment.</span>
+            </div>
+          ) : result.scan.limitations.length > 0 ? (
             <div className="callout callout-warning">
               <TriangleAlert size={16} />
               <div>
@@ -1504,6 +2087,11 @@ function ScanningPage() {
                   <p key={index}>{item}</p>
                 ))}
               </div>
+            </div>
+          ) : (
+            <div className="callout callout-info scan-no-limitations">
+              <ShieldCheck size={16} />
+              <span>No scan limitations were reported.</span>
             </div>
           )}
         </section>
@@ -1598,6 +2186,8 @@ function VulnerabilitiesPage() {
   const queryClient = useQueryClient()
   const [searchText, setSearchText] = useState('')
   const [search, setSearch] = useState('')
+  const [categoryText, setCategoryText] = useState('')
+  const [category, setCategory] = useState('')
   const [severity, setSeverity] = useState('')
   const [status, setStatus] = useState('')
   const [selectedFinding, setSelectedFinding] = useState<ScanFinding | null>(
@@ -1613,8 +2203,16 @@ function VulnerabilitiesPage() {
     return () => window.clearTimeout(timer)
   }, [searchText])
 
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => setCategory(categoryText.trim()),
+      300,
+    )
+    return () => window.clearTimeout(timer)
+  }, [categoryText])
+
   const findings = useQuery({
-    queryKey: ['findings', limit, offset, severity, status, search],
+    queryKey: ['findings', limit, offset, severity, status, search, category],
     queryFn: () =>
       vulnerabilityService.list({
         limit,
@@ -1622,6 +2220,7 @@ function VulnerabilitiesPage() {
         severity: severity || undefined,
         status: status || undefined,
         search: search || undefined,
+        vulnerability_type: category || undefined,
       }),
   })
 
@@ -1645,6 +2244,7 @@ function VulnerabilitiesPage() {
       await Promise.all([
         summary.refetch(),
         queryClient.invalidateQueries({ queryKey: ['dashboard-overview'] }),
+        queryClient.invalidateQueries({ queryKey: ['dashboard-trends'] }),
       ])
     },
     onError: (error) => notify(getApiErrorMessage(error), 'error'),
@@ -1718,6 +2318,20 @@ function VulnerabilitiesPage() {
               />
             </div>
 
+            <div className="search-field">
+              <Search size={15} />
+              <input
+                value={categoryText}
+                maxLength={100}
+                aria-label="Filter by finding category"
+                onChange={(event) => {
+                  setCategoryText(event.target.value)
+                  setOffset(0)
+                }}
+                placeholder="Filter by category"
+              />
+            </div>
+
             <select
               value={severity}
               onChange={(event) => {
@@ -1746,6 +2360,7 @@ function VulnerabilitiesPage() {
               <option value="open">Open</option>
               <option value="in_progress">In progress</option>
               <option value="resolved">Resolved</option>
+              <option value="ignored">Ignored</option>
               <option value="false_positive">False positive</option>
             </select>
           </div>
@@ -1974,18 +2589,7 @@ function ReportsPage() {
       const scan = scans.data?.find((item) => item.id === scanId)
       if (!scan) throw new Error('The selected scan is no longer available.')
 
-      const repo = repos.data?.find(
-        (item) => item.id === scan.repository_id,
-      )
-
-      const scanFindings =
-        await vulnerabilityService.listAllForScan(scan.id)
-
-      return {
-        scan,
-        repositoryName: repo?.full_name ?? scan.repository_id,
-        findings: scanFindings,
-      }
+      return reportService.getRepositoryReport(scan.repository_id, scan.id)
     },
     onSuccess: (report) => {
       downloadReport(report)
@@ -2152,12 +2756,18 @@ function PullRequestsPage() {
     },
     onSuccess: async (data) => {
       setReview(data)
-      notify('Pull request security review completed.', 'success')
+      notify(
+        data.status === 'completed'
+          ? 'Pull request security review completed.'
+          : `Pull request review status: ${formatStatus(data.status)}.`,
+        data.status === 'completed' ? 'success' : 'info',
+      )
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ['scan-history'] }),
         queryClient.invalidateQueries({ queryKey: ['findings'] }),
         queryClient.invalidateQueries({ queryKey: ['finding-summary'] }),
         queryClient.invalidateQueries({ queryKey: ['dashboard-overview'] }),
+        queryClient.invalidateQueries({ queryKey: ['dashboard-trends'] }),
       ])
     },
     onError: (error) => notify(getApiErrorMessage(error), 'error'),
@@ -2340,11 +2950,22 @@ function PullRequestsPage() {
                 <div>
                   <strong>Review {formatStatus(review.status)}</strong>
                   <p>{review.summary}</p>
+                  <p>Changed files: {review.changed_files}</p>
                   <p>Files analyzed: {review.files_analyzed}</p>
-                  <p>Review status: {formatStatus(review.status)}</p>
+                  <p>Reviewed head commit: {review.head_sha}</p>
                   <p>Scan ID: {review.scan_id}</p>
                 </div>
               </div>
+              {review.head_sha !== selected.request.head_sha && (
+                <div className="callout callout-warning">
+                  <TriangleAlert size={16} />
+                  <span>
+                    The pull request head changed after it was listed. This
+                    review is for {review.head_sha.slice(0, 8)}, not the
+                    previously listed {selected.request.head_sha.slice(0, 8)}.
+                  </span>
+                </div>
+              )}
 
               <PanelHeading
                 title="Review findings"
@@ -2601,6 +3222,71 @@ function MergeIntelligencePage() {
 
               <section className="panel">
                 <PanelHeading
+                  title="Logical merge conflicts"
+                  subtitle="Semantic incompatibilities identified across the branch changes"
+                />
+
+                {analysis.conflicts.length ? (
+                  analysis.conflicts.map((conflict, index) => (
+                    <div
+                      className="report-finding"
+                      key={`${conflict.conflict_type}-${index}`}
+                    >
+                      <div>
+                        <StatusBadge
+                          tone={
+                            conflict.status === 'confirmed'
+                              ? 'danger'
+                              : 'warning'
+                          }
+                        >
+                          {formatStatus(conflict.status)}
+                        </StatusBadge>
+                        <StatusBadge>
+                          {Math.round(conflict.confidence * 100)}% confidence
+                        </StatusBadge>
+                      </div>
+                      <strong>{conflict.conflict_type}</strong>
+                      <p>{conflict.explanation}</p>
+                      <DetailSection
+                        title="Affected files"
+                        text={conflict.affected_files.join('\n')}
+                      />
+                      {conflict.related_symbols.length > 0 && (
+                        <DetailSection
+                          title="Related symbols"
+                          text={conflict.related_symbols.join('\n')}
+                        />
+                      )}
+                      {conflict.dependency_description && (
+                        <DetailSection
+                          title="Dependency"
+                          text={conflict.dependency_description}
+                        />
+                      )}
+                      {conflict.evidence.map((evidence, evidenceIndex) => (
+                        <DetailSection
+                          key={`${evidence.branch}-${evidence.file_path}-${evidenceIndex}`}
+                          title={`${evidence.branch} · ${evidence.file_path}:${evidence.line_start}-${evidence.line_end}`}
+                          text={evidence.code}
+                        />
+                      ))}
+                    </div>
+                  ))
+                ) : (
+                  <div className="empty-state">
+                    <CheckCircle2 size={19} />
+                    <strong>No logical conflicts identified</strong>
+                    <span>
+                      No semantic incompatibilities were returned for these
+                      branch changes.
+                    </span>
+                  </div>
+                )}
+              </section>
+
+              <section className="panel">
+                <PanelHeading
                   title="Security findings"
                   subtitle="Findings returned by merge intelligence"
                 />
@@ -2776,8 +3462,10 @@ function SettingsPage() {
             <strong>GitHub OAuth</strong>
             <span>
               {account.isSuccess
-                ? `Authenticated as ${account.data.username}.`
-                : 'Sign in with GitHub to connect your repositories.'}
+                ? `Signed in as ${account.data.username} · ${account.data.email ?? 'No verified email returned by GitHub'}.`
+                : account.isLoading
+                  ? 'Checking the current GitHub session…'
+                  : 'Sign in with GitHub to connect your repositories.'}
             </span>
           </div>
           <Link
@@ -2903,7 +3591,7 @@ function LoginPage() {
         </div>
 
         <div className="login-side-art">
-          <div className="login-art-orbit orbit-one" />
+          <div className="login-art-orbit" />
           <div className="login-art-orbit orbit-two" />
           <div className="login-art-core">
             <Shield size={43} />

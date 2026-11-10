@@ -21,7 +21,13 @@ from app.schemas.finding import (
 router = APIRouter(prefix="/findings", tags=["Findings"])
 
 SEVERITIES = ("critical", "high", "medium", "low", "info")
-STATUSES = ("open", "in_progress", "resolved", "false_positive")
+STATUSES = (
+    "open",
+    "in_progress",
+    "resolved",
+    "ignored",
+    "false_positive",
+)
 
 
 def _finding_query(current_user: User):
@@ -198,7 +204,7 @@ def get_findings(
     finding_status: str | None = Query(
         default=None,
         alias="status",
-        pattern="^(open|in_progress|resolved|false_positive)$",
+        pattern="^(open|in_progress|resolved|ignored|false_positive)$",
     ),
     scan_id: uuid.UUID | None = None,
     repository_id: uuid.UUID | None = None,

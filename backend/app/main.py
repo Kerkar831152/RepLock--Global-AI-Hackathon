@@ -15,6 +15,7 @@ from app.api.dashboard import router as dashboard_router
 from app.api.repository_security import router as repository_security_router
 from app.api.pull_requests import router as pull_requests_router
 from app.api.merge_intelligence import router as merge_intelligence_router
+from app.api.reports import router as reports_router
 
 from app.services.ai_service import ai_service
 from app.services.research_service import research_service
@@ -62,6 +63,7 @@ routers = [
     repository_security_router,
     pull_requests_router,
     merge_intelligence_router,
+    reports_router,
 ]
 
 for router in routers:

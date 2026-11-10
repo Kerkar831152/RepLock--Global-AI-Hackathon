@@ -1,6 +1,6 @@
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel
@@ -40,3 +40,17 @@ class DashboardOverviewResponse(BaseModel):
     latest_scan: RecentScanResponse | None
     recent_scans: list[RecentScanResponse]
     most_affected_files: list[AffectedFileResponse]
+
+
+class SecurityTrendPoint(BaseModel):
+    date: date
+    scans: int
+    findings: int
+    critical: int
+    high: int
+    unresolved: int
+
+
+class SecurityTrendResponse(BaseModel):
+    days: int
+    items: list[SecurityTrendPoint]

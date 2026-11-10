@@ -15,6 +15,10 @@ class ScanResponse(BaseModel):
     id: uuid.UUID
     repository_id: uuid.UUID
     commit_sha: str | None
+    changed_files: int | None
+    files_analyzed: int | None
+    semgrep_findings: int | None
+    limitations: list[str] | None
     status: str
     scan_type: str
     summary: str | None
